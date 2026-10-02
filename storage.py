@@ -16,6 +16,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS snapshots(
                 day TEXT, queue TEXT, hash TEXT, slots TEXT,
                 PRIMARY KEY(day, queue));
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             """
         )
 
@@ -49,6 +50,17 @@ class Store:
             "SELECT COUNT(DISTINCT user_id) FROM subs").fetchone()[0]
 
     # --- знімки графіків ---
+    def bind_source(self, name: str) -> bool:
+        """Знімки від іншого джерела (напр. demo) не можна порівнювати з новими:
+        стираємо їх, щоб перемикання не розіслало хибні «зміни». True, якщо стерли."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='source'").fetchone()
+        if row and row[0] == name:
+            return False
+        self.db.execute("DELETE FROM snapshots")
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES('source', ?)", (name,))
+        self.db.commit()
+        return row is not None
+
     def is_empty(self) -> bool:
         return self.db.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone() is None
 

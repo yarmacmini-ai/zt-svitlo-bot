@@ -40,8 +40,11 @@ def today() -> date:
     return datetime.now(KYIV).date()
 
 
+SOURCE = os.getenv("SOURCE", "demo")
 store = Store(os.getenv("DB_PATH", "svitlo.db"))
-source = make_source(os.getenv("SOURCE", "demo"))
+source = make_source(SOURCE)
+if store.bind_source(SOURCE):
+    log.info("Джерело змінилось на %s: старі знімки стерто", SOURCE)
 
 
 # ---------- форматування ----------
@@ -137,8 +140,15 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
     for day in sorted(schedule):
         if day < today().isoformat():
             continue
-        changed = [q for q, slots in schedule[day].items()
-                   if store.update_snapshot(day, q, slots)]
+        changed = []
+        for q, slots in schedule[day].items():
+            prev = store.get_slots(day, q)
+            if not store.update_snapshot(day, q, slots):
+                continue
+            # Новий день без відключень з'являється щодня — про це мовчимо.
+            if prev is None and not slots:
+                continue
+            changed.append(q)
         if not changed:
             continue
         log.info("%s: змінились черги %s", day, changed)
@@ -151,12 +161,45 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.05)  # ліміти Telegram на розсилку
 
         if CHANNEL_ID:
-            me = await bot.get_me()
-            lines = [f"⚡️ <b>Графік відключень, {human_day(day)}</b>", ""]
-            lines += [f"{q}: {fmt_slots(schedule[day].get(q))}"
-                      for q in QUEUES if q in schedule[day]]
-            lines += ["", f"Сповіщення лише для вашої черги: @{me.username}"]
-            await send_safe(bot, CHANNEL_ID, "\n".join(lines))
+            await send_safe(bot, CHANNEL_ID, await channel_text(bot, day, schedule[day]))
+
+
+async def channel_text(bot, day: str, queues: dict) -> str:
+    me = await bot.get_me()
+    lines = [f"⚡️ <b>Графік відключень, {human_day(day)}</b>", ""]
+    lines += [f"{q}: {fmt_slots(queues.get(q))}" for q in QUEUES if q in queues]
+    lines += ["", f"Сповіщення лише для вашої черги: @{me.username}"]
+    return "\n".join(lines)
+
+
+async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Тестовий пост у канал. Доступний лише адмінам каналу."""
+    msg = update.effective_message
+    if not CHANNEL_ID:
+        await msg.reply_text("CHANNEL_ID не задано.")
+        return
+    try:
+        member = await ctx.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
+    except TelegramError as e:
+        await msg.reply_text(f"Не бачу канал: {e.message}. Бот має бути адміном каналу.")
+        return
+    if member.status not in ("creator", "administrator"):
+        await msg.reply_text("Команда лише для адмінів каналу.")
+        return
+
+    day = today().isoformat()
+    queues = {q: store.get_slots(day, q) for q in QUEUES}
+    queues = {q: s for q, s in queues.items() if s is not None}
+    if not queues:
+        await msg.reply_text("Графіка на сьогодні ще немає в базі.")
+        return
+    text = "🧪 <i>Тестовий пост</i>\n\n" + await channel_text(ctx.bot, day, queues)
+    try:
+        await ctx.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+    except TelegramError as e:
+        await msg.reply_text(f"Канал відхилив пост: {e.message}")
+        return
+    await msg.reply_text("Надіслав тестовий пост у канал.")
 
 
 async def post_init(app: Application):
@@ -177,6 +220,7 @@ def main():
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("testpost", cmd_testpost))
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=10)
     app.run_polling()

@@ -16,12 +16,9 @@ Telegram-бот графіків відключень світла для Жит
 |---|---|
 | `bot.py` | Бот на python-telegram-bot 21.6: `/start` (вибір черг кнопками), `/my`, `/stop`, `/stats`; опитування джерела через JobQueue кожні `POLL_MINUTES`; персональні сповіщення й пост у канал |
 | `storage.py` | SQLite: підписки та знімки графіків із хешем для виявлення змін |
-| `source.py` | Джерела: `DemoSource` (`data/demo.json`) і `ZtoeSource` (Playwright перехоплює JSON з API сайту обленерго). `normalize_ztoe()` **не написана** — кидає `NotImplementedError` |
-| `discover.py` | Розвідка API обленерго: пише в stdout статус сторінки (перевірка геоблокування), усі XHR/fetch-запити і JSON-відповіді |
+| `source.py` | Джерела: `DemoSource` (`data/demo.json`) і `ZtoeSource` — httpx-запит до `ztoe.com.ua/unhooking-search.php` і `parse_ztoe()` (HTML-таблиця, червоні клітинки = відключення) |
 | `Dockerfile` | Легкий образ бота (python:3.12-slim, без браузера) |
-| `Dockerfile.discover` | Тимчасовий образ для розвідки на `mcr.microsoft.com/playwright/python:v1.47.0-noble`. **Тег не перевірений збіркою** |
 | `railway.json` | builder DOCKERFILE, restart ON_FAILURE |
-| `.github/workflows/deploy.yml` | Деплой через Railway CLI: `railway up --service zt_tg_channel --ci`, секрет `RAILWAY_TOKEN` |
 
 Нормалізований формат графіка, який має повертати будь-яке джерело:
 
@@ -31,26 +28,17 @@ Telegram-бот графіків відключень світла для Жит
 
 Перевірено: залежності з `requirements.txt` ставляться, усі модулі імпортуються. Смоук-тест пройдено: перший запуск зберігає стан мовчки, зміна графіка черги 1.1 дає сповіщення лише підписнику 1.1 плюс пост у канал.
 
-## Поточна проблема: деплой на Railway
+## Деплой (з 2026-10-02)
 
-1. Сервіс, створений з GitHub-репозиторію, падає з помилкою `Failed to fetch repository files`. Доступ GitHub App Railway виставлено на All repositories. Репозиторій зроблено публічним, але помилка лишилася. Код до цього не причетний: помилка виникає до збірки.
-2. Як обхід додано GitHub Actions + Railway CLI. Секрет `RAILWAY_TOKEN` (Project Token) користувач мав додати вручну. Чи пройшов хоч один запуск workflow — невідомо.
-3. Railway зараз показує: «There is no active deployment for this service. Deploy the repo yaroslavmak1995-prog/zt-svitlo-bot». Тобто сервіс досі прив'язаний до GitHub як до джерела.
-4. Не підтверджено, що `zt_tg_channel` — це назва саме **сервісу**, а не проєкту.
+- Код: `github.com/yarmacmini-ai/zt-svitlo-bot` (новий акаунт). Старий репо `yaroslavmak1995-prog/zt-svitlo-bot` і старий Railway-проєкт `zt_tg_channel` не використовуються.
+- Railway: акаунт yarmacmini@gmail.com, проєкт `beneficial-elegance`, сервіс `zt-svitlo-bot`, автодеплой з `main`, volume `/data`.
+- Змінні: `BOT_TOKEN`, `CHANNEL_ID`, `SOURCE=ztoe`, `POLL_MINUTES=10`, `DB_PATH=/data/svitlo.db`.
+- `gh` і `railway` CLI на машині користувача залогінені в старі акаунти.
 
-## Задачі по порядку
+## Відкрите
 
-1. **Задеплоїти бота.** Найпростіший шлях — `railway login`, потім `railway link` і `railway up` прямо з цієї машини, повністю оминаючи GitHub. Якщо треба лишити автодеплой через Actions:
-   - перевірити запуски (`gh run list`, `gh run view --log-failed`);
-   - через `railway status` перевірити точну назву сервісу і виправити `SVC` у `deploy.yml`;
-   - у сервісі відв'язати GitHub як Source.
-2. **Налаштувати сервіс:**
-   - змінні `BOT_TOKEN` (від @BotFather — попросити в користувача), `CHANNEL_ID` (необов'язково), `SOURCE=demo`, `POLL_MINUTES=10`, `DB_PATH=/data/svitlo.db`;
-   - Volume на `/data`.
-
-   Перевірити в логах рядок «Початковий стан збережено без розсилки» і відповідь бота на `/start`.
-3. **Розвідка API обленерго.** Сайт `ztoe.com.ua/unhooking.php` перенаправляє на SPA `ztoe-poweron.inneti.net`, дані вантажаться з API. Можна запустити `python discover.py` локально, щоб побачити формат. Але **геоблокування треба перевірити саме з Railway**: сервери там за кордоном. Для цього на час розвідки задати сервісу `RAILWAY_DOCKERFILE_PATH=Dockerfile.discover`, потім прибрати. Якщо з Railway сайт не відкривається, потрібен сервер в Україні або проксі; узгодити з користувачем.
-4. **Дописати `normalize_ztoe()`** за реальними відповідями API. Після цього замінити Playwright прямим HTTP-запитом (httpx), щоб бот на сервері лишився легким. Дані в демо-файлі прострочені (25 вересня), для перевірки оновити дату.
+- Перевірити, як сайт показує графік на завтра (дві дати в одній таблиці чи окрема таблиця): парсер підтримує обидва варіанти, але реального прикладу ще не було.
+- Чи є на сайті інші кольори клітинок (напр. «можливе відключення»): зараз будь-який небілий рахується відключенням і пишеться попередження в лог.
 
 ## Обмеження
 
