@@ -7,15 +7,18 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes)
+                          ContextTypes, MessageHandler, filters)
 
+import address
 from source import make_source
 from storage import Store
 
@@ -70,13 +73,38 @@ def queues_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+MENU = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔎 Знайти чергу за адресою", callback_data="menu:addr")],
+    [InlineKeyboardButton("Я знаю свою чергу", callback_data="menu:pick")],
+])
+ASK_ADDRESS = ("Напишіть вулицю і номер будинку в Житомирі, наприклад:\n"
+               "<i>Київська 24</i>")
+SITE_DOWN = ("Сайт Житомиробленерго зараз не відповідає, тож адресу перевірити не можу. "
+             "Спробуйте пізніше або оберіть чергу вручну.")
+
+
 # ---------- команди ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Оберіть свою чергу — я напишу, щойно для неї з'явиться або зміниться "
-        "графік відключень. Можна обрати кілька (дім, робота, батьки).\n\n"
-        "Свою чергу можна дізнатися на сайті Житомиробленерго за адресою.",
-        reply_markup=queues_keyboard(update.effective_user.id))
+    ctx.user_data.clear()
+    mine = store.user_queues(update.effective_user.id)
+    text = ("Я надсилаю графік відключень світла у Житомирі лише для вашої черги — "
+            "і лише коли він з'являється або змінюється. Без зайвих повідомлень.\n\n")
+    text += (f"Ваші черги: <b>{', '.join(mine)}</b>. Додати ще одну адресу?"
+             if mine else "Спершу знайдемо вашу чергу. Можна просто написати адресу.")
+    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=MENU)
+
+
+async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "menu:addr":
+        ctx.user_data.clear()
+        await query.message.reply_text(ASK_ADDRESS, parse_mode="HTML")
+    else:
+        await query.message.reply_text(
+            "Оберіть черги — можна кілька (дім, робота, батьки). "
+            "Повторне натискання знімає підписку.",
+            reply_markup=queues_keyboard(query.from_user.id))
 
 
 async def on_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -87,11 +115,113 @@ async def on_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_reply_markup(queues_keyboard(query.from_user.id))
 
 
+# ---------- пошук черги за адресою ----------
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Будь-який текст у приваті — це адреса: «Київська 24», «Київська» або «24»."""
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    street = ctx.user_data.get("street")
+    try:
+        if street and re.fullmatch(r"\d+[\w/\-]*", text):
+            await show_house(msg, ctx, street, text)
+            return
+        query, house = address.split_address(text)
+        found = await address.search_streets(query)
+    except (httpx.HTTPError, ValueError):
+        log.exception("Пошук адреси на сайті обленерго не вдався")
+        await msg.reply_text(SITE_DOWN, reply_markup=MENU)
+        return
+
+    if not found:
+        await msg.reply_text(
+            f"Не знайшов вулицю «{query}» у Житомирі. Спробуйте лише назву, без «вул.», "
+            "наприклад: <i>Київська</i>. Або оберіть чергу вручну.",
+            parse_mode="HTML", reply_markup=MENU)
+        return
+    ctx.user_data["house"] = house
+    if len(found) == 1:
+        await pick_street(msg, ctx, found[0][0])
+        return
+    buttons = [[InlineKeyboardButton(name, callback_data=f"s:{sid}")] for sid, name in found]
+    await msg.reply_text("Яка саме вулиця?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def on_street(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await pick_street(query.message, ctx, query.data.split(":", 1)[1])
+    except (httpx.HTTPError, ValueError):
+        log.exception("Пошук адреси на сайті обленерго не вдався")
+        await query.message.reply_text(SITE_DOWN, reply_markup=MENU)
+
+
+async def pick_street(msg, ctx, street_id: str):
+    ctx.user_data["street"] = street_id
+    house = ctx.user_data.pop("house", None)
+    if house:
+        await show_house(msg, ctx, street_id, house)
+    else:
+        name = await address.street_name(street_id)
+        await msg.reply_text(f"{name}. Який номер будинку?")
+
+
+async def show_house(msg, ctx, street_id: str, house: str):
+    name = await address.street_name(street_id)
+    records = await address.street_records(street_id)
+    hits = address.find_house(records, house)
+    again = InlineKeyboardButton("🔎 Інша адреса", callback_data="menu:addr")
+
+    if not hits:
+        queues = sorted({r["queue"] for r in records if r["queue"]})
+        buttons = [[InlineKeyboardButton(f"Підписатися на {q}", callback_data=f"sub:{q}")]
+                   for q in queues]
+        await msg.reply_text(
+            f"Будинку {house} немає в списку обленерго для «{name}». Напишіть інший номер"
+            + (f" або оберіть чергу — на цій вулиці є: {', '.join(queues)}." if queues else "."),
+            reply_markup=InlineKeyboardMarkup(buttons + [[again]]))
+        return
+
+    queues = list(dict.fromkeys(r["queue"] for r in hits if r["queue"]))
+    if not queues:
+        await msg.reply_text(
+            f"📍 {name}, {house}\nЦей будинок не відключають за графіками — "
+            "лише у разі аварій. Підписуватися не потрібно.",
+            reply_markup=InlineKeyboardMarkup([[again]]))
+        return
+    ctx.user_data.pop("street", None)
+    lines = [f"📍 {name}, {house}"]
+    if len(queues) == 1:
+        lines.append(f"Ваша черга: <b>{queues[0]}</b>")
+    else:  # різні черги для побутових і юридичних споживачів
+        lines.append("За цією адресою кілька черг:")
+        lines += [f"• <b>{r['queue']}</b> — {r['kind']}" for r in hits if r["queue"]]
+    buttons = [[InlineKeyboardButton(f"✅ Підписатися на {q}", callback_data=f"sub:{q}")]
+               for q in queues]
+    await msg.reply_text("\n".join(lines), parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(buttons + [[again]]))
+
+
+async def on_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    queue = query.data.split(":", 1)[1]
+    uid = query.from_user.id
+    if queue not in store.user_queues(uid):
+        store.toggle(uid, queue)
+    await query.answer(f"Підписано на чергу {queue}")
+    await query.message.reply_text(
+        f"Готово! Черга <b>{queue}</b>. Напишу, щойно для неї з'явиться або зміниться "
+        "графік відключень.\n\n/my — графік на сьогодні й завтра\n"
+        "/start — додати ще адресу\n/stop — відписатися",
+        parse_mode="HTML")
+
+
 async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     queues = store.user_queues(uid)
     if not queues:
-        await update.effective_message.reply_text("Ви ще не обрали черги. Натисніть /start.")
+        await update.effective_message.reply_text(
+            "Ви ще не підписані на жодну чергу.", reply_markup=MENU)
         return
     now = today()
     days = [date.fromordinal(now.toordinal() + i).isoformat() for i in (0, 1)]
@@ -203,6 +333,14 @@ async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
+    try:  # меню команд у Telegram; без нього бот теж працює
+        await app.bot.set_my_commands([
+            BotCommand("start", "Знайти чергу за адресою"),
+            BotCommand("my", "Мій графік на сьогодні й завтра"),
+            BotCommand("stop", "Відписатися від усіх черг"),
+        ])
+    except TelegramError:
+        log.exception("Не вдалося задати меню команд")
     # Перший запуск: запам'ятати поточний стан мовчки, без розсилки.
     if store.is_empty():
         try:
@@ -222,6 +360,11 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(on_street, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(on_subscribe, pattern=r"^sub:"))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=10)
     app.run_polling()
 
