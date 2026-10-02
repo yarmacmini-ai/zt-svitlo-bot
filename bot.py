@@ -21,6 +21,7 @@ from storage import Store
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # інакше в лог потрапляє URL з токеном
 log = logging.getLogger("svitlo")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
