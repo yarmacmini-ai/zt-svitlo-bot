@@ -50,6 +50,8 @@ class FakeBot:
 
     async def send_message(self, cid, text, reply_markup=None, reply_parameters=None, **k):
         sent.append(("msg", cid, text, reply_parameters and reply_parameters.message_id))
+        if cid == CH and ("Вимикаємо" in text or "Вмикаємо" in text):
+            assert k.get("disable_notification"), "пости перемикань — без звуку"
         return self._msg(cid)
 
     async def send_photo(self, cid, photo, caption=None, reply_parameters=None, **k):
