@@ -79,25 +79,57 @@ def hour_bar(slots: Slots) -> str:
 
 
 # ---------- пост у канал ----------
+def short(hhmm_: str) -> str:
+    """"08:00" -> "8", "16:30" -> "16:30" — як на картинці."""
+    h, m = hhmm_.split(":")
+    h = "00" if h == "00" else str(int(h))  # «0–0:30» читається гірше за «00–00:30»
+    return h if m == "00" else f"{h}:{m}"
+
+
+def short_ranges(slots: Slots) -> str:
+    return ", ".join(f"{short(a)}–{short(b)}" for a, b in slots)
+
+
+def command_line(command: list[tuple[str, str, str]] | None) -> str | None:
+    """«⚙️ Укренерго: 6–8 — 0,5 черги · 8–16 — 1,5 · …»; без обмежень — пропускаємо."""
+    segs = [(a, b, label) for a, b, label in command or [] if "без" not in label]
+    if not segs:
+        return None
+    parts = [f"{short(a)}–{short(b)} — {label if i == 0 else label.split()[0]}"
+             for i, (a, b, label) in enumerate(segs)]
+    return "⚙️ Укренерго: " + " · ".join(parts)
+
+
+def grouped(queues: dict[str, Slots]) -> list[tuple[list[str], Slots]]:
+    """Черги з однаковим графіком в один рядок, у порядку першої черги."""
+    groups: dict[tuple, list[str]] = {}
+    for q in QUEUES:
+        groups.setdefault(tuple(queues.get(q) or []), []).append(q)
+    return [(qs, list(slots)) for slots, qs in groups.items()]
+
+
 def channel_caption(day: date, today: date, queues: dict[str, Slots], bot_username: str,
-                    changed: set[str] | None = None, cancelled: bool = False) -> str:
-    """Підпис до картинки (ліміт Telegram — 1024 символи, тут ~650)."""
+                    changed: set[str] | None = None, cancelled: bool = False,
+                    command: list | None = None) -> str:
+    """Підпис до картинки: шапка на 2–3 рядки, перелік черг — у згорнутій цитаті."""
     when = day_inline(day, today)
     if cancelled:
         head = f"✅ <b>Відключення {when} скасовано</b>"
     elif changed:
-        head = f"🔄 <b>Оновлено графік {when}</b>\nЗмінилось: {', '.join(sorted(changed))}"
+        head = f"🔄 <b>Оновлено графік {when}</b> · змінилось: {', '.join(sorted(changed))}"
     else:
         head = f"⚡️ <b>Графік відключень {when}</b>"
-    lines = [head, summary(queues).capitalize(), ""]
-    for i, q in enumerate(QUEUES):
-        slots = queues.get(q) or []
-        mark = " ✏️" if changed and q in changed else ""
-        body = f"🔴 {ranges(slots)} · {hours(off_minutes(slots))}" if slots else "🟢 світло є"
-        lines.append(f"<b>{q}</b>  {body}{mark}")
-        if i % 2 and i < 11:
-            lines.append("")
-    lines += ["", f"🔔 Лише ваша черга й нагадування за 30 хв — @{bot_username}"]
+    lines = [head, summary(queues).capitalize()]
+    cmd = command_line(command)
+    if cmd and not cancelled:
+        lines.append(cmd)
+    rows = []
+    for qs, slots in grouped(queues):
+        mark = " ✏️" if changed and changed & set(qs) else ""
+        body = f"{short_ranges(slots)} · {hours(off_minutes(slots))}" if slots else "світло є"
+        rows.append(f"{'🔴' if slots else '🟢'} <b>{' · '.join(qs)}</b> — {body}{mark}")
+    lines.append("<blockquote expandable>" + "\n".join(rows) + "</blockquote>")
+    lines.append(f"🔔 Своя черга й нагадування за 30 хв — @{bot_username}")
     return "\n".join(lines)
 
 

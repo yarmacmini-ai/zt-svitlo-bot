@@ -78,7 +78,8 @@ class Store:
         """Стирає старі дні: знімки, позначки подій, id постів."""
         self.db.execute("DELETE FROM sent WHERE day < ?", (before_day,))
         self.db.execute("DELETE FROM snapshots WHERE day < ?", (before_day,))
-        self.db.execute("DELETE FROM meta WHERE key LIKE 'post:%' AND substr(key, 6) < ?", (before_day,))
+        self.db.execute("DELETE FROM meta WHERE (key LIKE 'post:%' OR key LIKE 'cmd:%') "
+                        "AND substr(key, instr(key, ':') + 1) < ?", (before_day,))
         self.db.commit()
 
     # --- знімки графіків ---

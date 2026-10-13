@@ -4,6 +4,7 @@
 
 Порожній список = черга без відключень у цей день.
 """
+import html
 import json
 import logging
 import re
@@ -91,15 +92,38 @@ def parse_ztoe(html: str) -> Schedule:
     raise ValueError("Таблицю графіків на сторінці не знайдено")
 
 
+# «На 13.10.2026р. по команді НЕК "Укренерго" буде застосовано: з 06:00 до 08:00 - 0,5 черги …»
+_CMD_DAY = re.compile(r"На\s+(\d\d\.\d\d\.\d{4})\s*р?\.?\s+по команді НЕК.*?застосовано:(.*?)(?=На\s+\d\d\.\d\d\.\d{4}|Пошук черги|$)",
+                      re.S)
+_CMD_SEG = re.compile(r"з\s+(\d\d:\d\d)\s+до\s+(\d\d:\d\d)\s*-\s*([^\n<]+)")
+
+Command = list[tuple[str, str, str]]  # [("06:00", "08:00", "0,5 черги"), ...]
+
+
+def parse_command(page: str) -> dict[str, Command]:
+    """Обсяг обмежень за командою Укренерго по днях. Порожньо, якщо команди немає."""
+    text = html.unescape(re.sub(r"<br\s*/?>", "\n", page))
+    out = {}
+    for d, body in _CMD_DAY.findall(text):
+        day = datetime.strptime(d, "%d.%m.%Y").date().isoformat()
+        out[day] = [(a, b, label.strip().replace(",0 ", " ")) for a, b, label in _CMD_SEG.findall(body)]
+    return out
+
+
 class ZtoeSource:
     """Сторінка Житомиробленерго з таблицею черг. Звичайний HTML у windows-1251."""
+
+    def __init__(self):
+        self.commands: dict[str, Command] = {}  # з останнього fetch()
 
     async def fetch(self) -> Schedule:
         async with httpx.AsyncClient(timeout=30, headers={"User-Agent": USER_AGENT},
                                      follow_redirects=True) as client:
             resp = await client.get(ZTOE_URL)
             resp.raise_for_status()
-        return parse_ztoe(resp.content.decode("cp1251", errors="replace"))
+        page = resp.content.decode("cp1251", errors="replace")
+        self.commands = parse_command(page)
+        return parse_ztoe(page)
 
 
 def make_source(name: str):

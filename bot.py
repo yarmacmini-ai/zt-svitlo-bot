@@ -6,6 +6,7 @@
 і пост «О 14:00 вимикаємо / вмикаємо» перед кожним перемиканням.
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -270,6 +271,8 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     bot, t = ctx.bot, today()
+    for day, command in getattr(source, "commands", {}).items():  # обсяг обмежень Укренерго
+        store.set_meta(f"cmd:{day}", json.dumps(command, ensure_ascii=False))
     for day in sorted(schedule):
         if day < t.isoformat():
             continue
@@ -318,8 +321,10 @@ async def publish_day(bot, chat_id, d: date, queues: dict, *, changed: set | Non
         card.render, posts.day_title(d, t), posts.card_subtitle(d, queues), queues,
         updated=datetime.now(KYIV).strftime("%H:%M") if changed else None,
         changed=changed or set(), footer=f"Сповіщення для вашої черги → @{bot.username}")
-    caption = prefix + posts.channel_caption(d, t, queues, bot.username,
-                                             changed=changed, cancelled=cancelled)
+    command = store.get_meta(f"cmd:{d.isoformat()}")
+    caption = prefix + posts.channel_caption(d, t, queues, bot.username, changed=changed,
+                                             cancelled=cancelled,
+                                             command=json.loads(command) if command else None)
     prev = store.get_meta(f"post:{d.isoformat()}") if remember else None
     try:
         msg = await bot.send_photo(
