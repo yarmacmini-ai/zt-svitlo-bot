@@ -1,7 +1,7 @@
 """Картинка графіка для каналу: 1080×1350, читається на телефоні без збільшення.
 
 12 рядків-черг, на кожному доба як смуга: зелений трек — світло є,
-червоні блоки — відключення з годинами всередині. Праворуч — скільки годин без світла.
+червоні блоки — відключення з годинами всередині. Тривалість по чергах — у підписі до поста.
 """
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +12,7 @@ FONT = Path(__file__).parent / "fonts" / "Manrope.ttf"
 QUEUES = [f"{i}.{j}" for i in range(1, 7) for j in (1, 2)]
 
 W, H = 1080, 1350
-PAD = 56
+PAD = 48
 BG = "#F4F2EC"
 CARD = "#FFFFFF"
 INK = "#15171B"
@@ -65,13 +65,6 @@ def _draw_range(d, cx, cy, parts, size, fill):
         x += d.textlength(t, font=f)
 
 
-def hours_label(total_min: int) -> str:
-    if not total_min:
-        return "—"
-    h = total_min / 60
-    return f"{h:g} год".replace(".", ",")
-
-
 def _bolt(d: ImageDraw.ImageDraw, x: int, y: int, s: int):
     """Блискавка в жовтому колі (емодзі в шрифті немає)."""
     d.ellipse([x, y, x + s, y + s], fill=ACCENT)
@@ -100,8 +93,8 @@ def render(title: str, subtitle: str, queues: dict, *, updated: str | None = Non
 
     # --- картка з графіком ---
     top, left, right = 270, PAD, W - PAD
-    label_w, total_w, inner = 80, 104, 28
-    x0, x1 = left + inner + label_w, right - inner - total_w
+    label_w, inner = 72, 26
+    x0, x1 = left + inner + label_w, right - inner - 8
     per_min = (x1 - x0) / 1440
     row_h, bar_h, pair_gap = 56, 42, 16
     rows_top = top + 78
@@ -127,21 +120,17 @@ def render(title: str, subtitle: str, queues: dict, *, updated: str | None = Non
             x = x0 + h * 60 * per_min
             d.line([x, cy - bar_h / 2 + 8, x, cy + bar_h / 2 - 8], fill=TICK, width=2)
 
-        total = 0
         for a, b in slots:
             ma, mb = minutes(a), minutes(b)
-            total += mb - ma
             bx0, bx1 = x0 + ma * per_min, x0 + mb * per_min
             d.rounded_rectangle([bx0, cy - bar_h / 2, bx1, cy + bar_h / 2], radius=12, fill=OFF)
             # Не влазить навіть дрібним — без тексту: точні години є в підписі до поста.
             parts = _time_parts(a, b)
-            for size in (24, 20):
-                if _range_width(d, parts, size) + 12 <= bx1 - bx0:
+            for size in (24, 22, 20):
+                if _range_width(d, parts, size) + 8 <= bx1 - bx0:
                     _draw_range(d, (bx0 + bx1) / 2, cy + 1, parts, size, OFF_TEXT)
                     break
 
-        d.text((right - inner, cy), hours_label(total), font=font(28, 800 if total else 500),
-               fill=INK if total else FAINT, anchor="rm")
         y += row_h + (pair_gap if i % 2 else 0)
 
     # --- легенда й підпис ---

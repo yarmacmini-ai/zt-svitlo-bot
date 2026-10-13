@@ -93,7 +93,7 @@ def channel_caption(day: date, today: date, queues: dict[str, Slots], bot_userna
     for i, q in enumerate(QUEUES):
         slots = queues.get(q) or []
         mark = " ✏️" if changed and q in changed else ""
-        body = f"🔴 {ranges(slots)}" if slots else "🟢 світло є"
+        body = f"🔴 {ranges(slots)} · {hours(off_minutes(slots))}" if slots else "🟢 світло є"
         lines.append(f"<b>{q}</b>  {body}{mark}")
         if i % 2 and i < 11:
             lines.append("")

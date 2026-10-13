@@ -42,7 +42,7 @@ _QUEUE = re.compile(r">\s*([1-6]\.[12])\s*</b>")
 _CELL = re.compile(r"<td[^>]*background:\s*([#\w]+)[^>]*>\s*<a[^>]*>(?:&nbsp;|\s)*</a>",
                    re.S | re.I)
 _WHITE = {"white", "#fff", "#ffffff"}
-_RED = {"red", "#f00", "#ff0000"}
+_RED = {"red", "#f00", "#ff0000", "#ff3333"}  # легенда — #ff0000, клітинки — #ff3333
 SLOTS_PER_DAY = 48
 
 

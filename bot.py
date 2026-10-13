@@ -284,6 +284,10 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
                 continue
             changed.append(q)
         if not changed:
+            # День з відключеннями, по якому ще не було картки (напр. графік з'явився до
+            # оновлення бота) — публікуємо один раз, без «оновлено».
+            if CHANNEL_ID and any(schedule[day].values()) and not store.get_meta(f"post:{day}"):
+                await publish_day(bot, CHANNEL_ID, date.fromisoformat(day), schedule[day])
             continue
         log.info("%s: змінились черги %s", day, changed)
 
