@@ -18,6 +18,8 @@ Telegram-бот графіків відключень світла для Жит
 | `storage.py` | SQLite: підписки та знімки графіків із хешем для виявлення змін |
 | `source.py` | Джерела: `DemoSource` (`data/demo.json`) і `ZtoeSource` — httpx-запит до `ztoe.com.ua/unhooking-search.php` і `parse_ztoe()` (HTML-таблиця, червоні клітинки = відключення) |
 | `address.py` | Пошук черги за адресою: POST-форма `unhooking-search.php` (РЕМ 7 → місто 15647 → вулиця, параметр `all` прибирає ліміт у 10 записів) |
+| `posts.py` | Тексти постів і особистих повідомлень, розрахунок перемикань (`timeline`, `switch_events`) — чисті функції |
+| `card.py` | Картинка графіка для каналу (Pillow, `fonts/Manrope.ttf`) |
 | `Dockerfile` | Легкий образ бота (python:3.12-slim, без браузера) |
 | `railway.json` | builder DOCKERFILE, restart ON_FAILURE |
 

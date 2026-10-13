@@ -17,6 +17,8 @@ class Store:
                 day TEXT, queue TEXT, hash TEXT, slots TEXT,
                 PRIMARY KEY(day, queue));
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS sent(key TEXT PRIMARY KEY, day TEXT);
+            CREATE TABLE IF NOT EXISTS prefs(user_id INTEGER PRIMARY KEY, reminders INTEGER);
             """
         )
 
@@ -49,6 +51,36 @@ class Store:
         return self.db.execute(
             "SELECT COUNT(DISTINCT user_id) FROM subs").fetchone()[0]
 
+    def reminders_on(self, user_id: int) -> bool:
+        row = self.db.execute("SELECT reminders FROM prefs WHERE user_id=?", (user_id,)).fetchone()
+        return row is None or bool(row[0])  # за замовчуванням нагадування увімкнені
+
+    def set_reminders(self, user_id: int, on: bool) -> None:
+        self.db.execute("INSERT OR REPLACE INTO prefs VALUES(?,?)", (user_id, int(on)))
+        self.db.commit()
+
+    # --- службове: id постів, розіслані події ---
+    def get_meta(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, value))
+        self.db.commit()
+
+    def mark_sent(self, key: str, day: str) -> bool:
+        """True, якщо подію ще не розсилали (і тепер позначено). Захищає від дублів після рестарту."""
+        cur = self.db.execute("INSERT OR IGNORE INTO sent VALUES(?,?)", (key, day))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    def cleanup(self, before_day: str) -> None:
+        """Стирає старі дні: знімки, позначки подій, id постів."""
+        self.db.execute("DELETE FROM sent WHERE day < ?", (before_day,))
+        self.db.execute("DELETE FROM snapshots WHERE day < ?", (before_day,))
+        self.db.execute("DELETE FROM meta WHERE key LIKE 'post:%' AND substr(key, 6) < ?", (before_day,))
+        self.db.commit()
+
     # --- знімки графіків ---
     def bind_source(self, name: str) -> bool:
         """Знімки від іншого джерела (напр. demo) не можна порівнювати з новими:
@@ -78,6 +110,10 @@ class Store:
             (day, queue, digest, payload))
         self.db.commit()
         return True
+
+    def get_day(self, day: str) -> dict[str, Slots]:
+        rows = self.db.execute("SELECT queue, slots FROM snapshots WHERE day=?", (day,))
+        return {q: [tuple(s) for s in json.loads(v)] for q, v in rows}
 
     def get_slots(self, day: str, queue: str) -> Slots | None:
         row = self.db.execute(

@@ -1,24 +1,28 @@
 """Бот графіків відключень Житомира.
 
-Користувач обирає свою чергу (1.1–6.2) і отримує повідомлення лише тоді,
-коли графік його черги з'являється або змінюється. У канал іде зведення
-по всіх чергах при кожній зміні.
+Користувач знаходить свою чергу (1.1–6.2) за адресою і отримує повідомлення,
+коли графік черги з'являється або змінюється, а також нагадування за 30 хв до
+вимкнення й у момент увімкнення. У канал іде картинка графіка при кожній зміні
+і пост «О 14:00 вимикаємо / вмикаємо» перед кожним перемиканням.
 """
 import asyncio
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+                      ReplyParameters, Update)
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
 import address
+import card
+import posts
 from source import make_source
 from storage import Store
 
@@ -30,10 +34,11 @@ log = logging.getLogger("svitlo")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.getenv("CHANNEL_ID") or None
 POLL_MINUTES = int(os.getenv("POLL_MINUTES", "10"))
+CHANNEL_LEAD = 15   # пост «О 14:00 вимикаємо…» у канал — за стільки хвилин
+REMIND_LEAD = 30    # особисте «Через 30 хв вимкнуть світло»
+GRACE = 5           # після рестарту бота не надсилати події, що минули давніше
 
-QUEUES = [f"{i}.{j}" for i in range(1, 7) for j in (1, 2)]
-MONTHS = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня",
-          "серпня", "вересня", "жовтня", "листопада", "грудня"]
+QUEUES = posts.QUEUES
 
 KYIV = ZoneInfo("Europe/Kyiv")
 
@@ -50,27 +55,20 @@ if store.bind_source(SOURCE):
     log.info("Джерело змінилось на %s: старі знімки стерто", SOURCE)
 
 
-# ---------- форматування ----------
-def human_day(day: str) -> str:
-    d = datetime.strptime(day, "%Y-%m-%d").date()
-    delta = (d - today()).days
-    label = {0: "сьогодні", 1: "завтра"}.get(delta)
-    base = f"{d.day} {MONTHS[d.month - 1]}"
-    return f"{label}, {base}" if label else base
-
-
-def fmt_slots(slots) -> str:
-    if not slots:
-        return "без відключень"
-    return ", ".join(f"{a}–{b}" for a, b in slots)
-
-
+# ---------- клавіатури ----------
 def queues_keyboard(user_id: int) -> InlineKeyboardMarkup:
     mine = set(store.user_queues(user_id))
     buttons = [InlineKeyboardButton(("✅ " if q in mine else "") + q,
                                     callback_data=f"q:{q}") for q in QUEUES]
     rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
     return InlineKeyboardMarkup(rows)
+
+
+def reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    on = store.reminders_on(user_id)
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування за 30 хв",
+        callback_data="rem:off" if on else "rem:on")]])
 
 
 MENU = InlineKeyboardMarkup([
@@ -210,10 +208,20 @@ async def on_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         store.toggle(uid, queue)
     await query.answer(f"Підписано на чергу {queue}")
     await query.message.reply_text(
-        f"Готово! Черга <b>{queue}</b>. Напишу, щойно для неї з'явиться або зміниться "
-        "графік відключень.\n\n/my — графік на сьогодні й завтра\n"
-        "/start — додати ще адресу\n/stop — відписатися",
-        parse_mode="HTML")
+        f"Готово! Черга <b>{queue}</b>.\n\n"
+        "• Напишу, щойно для неї з'явиться або зміниться графік\n"
+        "• Нагадаю за 30 хв до вимкнення і коли світло має повернутись\n\n"
+        "/my — графік на сьогодні й завтра\n/start — додати ще адресу\n/stop — відписатися",
+        parse_mode="HTML", reply_markup=reminders_keyboard(uid))
+
+
+async def on_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    on = query.data == "rem:on"
+    store.set_reminders(query.from_user.id, on)
+    await query.answer("Нагадування увімкнено" if on else
+                       "Нагадування вимкнено. Про зміни графіка писатиму й надалі.", show_alert=not on)
+    await query.edit_message_reply_markup(reminders_keyboard(query.from_user.id))
 
 
 async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -223,18 +231,13 @@ async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "Ви ще не підписані на жодну чергу.", reply_markup=MENU)
         return
-    now = today()
-    days = [date.fromordinal(now.toordinal() + i).isoformat() for i in (0, 1)]
-    lines = []
-    for day in days:
-        known = [(q, store.get_slots(day, q)) for q in queues]
-        known = [(q, s) for q, s in known if s is not None]
-        if known:
-            lines.append(f"<b>{human_day(day).capitalize()}</b>")
-            lines += [f"Черга {q}: {fmt_slots(s)}" for q, s in known]
+    t = today()
+    blocks = [posts.personal_day(q, d, t, store.get_slots(d.isoformat(), q))
+              for q in queues for d in (t, posts.tomorrow(t))]
+    status = "увімкнено" if store.reminders_on(uid) else "вимкнено"
+    blocks.append(f"⏰ Нагадування за 30 хв до вимкнення: {status}")
     await update.effective_message.reply_text(
-        "\n".join(lines) or "Графіків на сьогодні й завтра ще не публікували.",
-        parse_mode="HTML")
+        "\n\n".join(blocks), parse_mode="HTML", reply_markup=reminders_keyboard(uid))
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -266,13 +269,14 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("Не вдалося отримати графік")
         return
 
-    bot = ctx.bot
+    bot, t = ctx.bot, today()
     for day in sorted(schedule):
-        if day < today().isoformat():
+        if day < t.isoformat():
             continue
+        before = store.get_day(day)
         changed = []
         for q, slots in schedule[day].items():
-            prev = store.get_slots(day, q)
+            prev = before.get(q)
             if not store.update_snapshot(day, q, slots):
                 continue
             # Новий день без відключень з'являється щодня — про це мовчимо.
@@ -283,53 +287,146 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
             continue
         log.info("%s: змінились черги %s", day, changed)
 
+        d = date.fromisoformat(day)
         for q in changed:
-            text = (f"⚡️ <b>Черга {q}, {human_day(day)}</b>\n"
-                    f"{fmt_slots(schedule[day][q])}")
+            text = posts.personal_change(q, d, t, schedule[day][q], before.get(q))
             for uid in store.subscribers(q):
                 await send_safe(bot, uid, text)
                 await asyncio.sleep(0.05)  # ліміти Telegram на розсилку
 
         if CHANNEL_ID:
-            await send_safe(bot, CHANNEL_ID, await channel_text(bot, day, schedule[day]))
+            first = not any(before.values())  # раніше цього дня відключень не було
+            await publish_day(bot, CHANNEL_ID, d, schedule[day],
+                              changed=None if first else set(changed),
+                              cancelled=not first and not any(schedule[day].values()))
 
 
-async def channel_text(bot, day: str, queues: dict) -> str:
-    me = await bot.get_me()
-    lines = [f"⚡️ <b>Графік відключень, {human_day(day)}</b>", ""]
-    lines += [f"{q}: {fmt_slots(queues.get(q))}" for q in QUEUES if q in queues]
-    lines += ["", f"Сповіщення лише для вашої черги: @{me.username}"]
-    return "\n".join(lines)
+def channel_button(bot) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔔 Сповіщення для моєї черги", url=f"https://t.me/{bot.username}?start=channel")]])
 
 
-async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Тестовий пост у канал. Доступний лише адмінам каналу."""
+async def publish_day(bot, chat_id, d: date, queues: dict, *, changed: set | None = None,
+                      cancelled: bool = False, prefix: str = "", remember: bool = True):
+    """Картинка графіка + підпис. Оновлення йде відповіддю на попередній пост цього дня."""
+    t = today()
+    png = await asyncio.to_thread(  # Pillow — синхронний; не блокуємо цикл подій
+        card.render, posts.day_title(d, t), posts.card_subtitle(d, queues), queues,
+        updated=datetime.now(KYIV).strftime("%H:%M") if changed else None,
+        changed=changed or set(), footer=f"Сповіщення для вашої черги → @{bot.username}")
+    caption = prefix + posts.channel_caption(d, t, queues, bot.username,
+                                             changed=changed, cancelled=cancelled)
+    prev = store.get_meta(f"post:{d.isoformat()}") if remember else None
+    try:
+        msg = await bot.send_photo(
+            chat_id, png, caption=caption, parse_mode="HTML", reply_markup=channel_button(bot),
+            reply_parameters=ReplyParameters(int(prev), allow_sending_without_reply=True)
+            if prev else None)
+    except TelegramError:
+        log.exception("Не вдалося опублікувати графік у %s", chat_id)
+        return
+    if remember:
+        store.set_meta(f"post:{d.isoformat()}", str(msg.message_id))
+
+
+# ---------- перемикання за графіком: пости в канал і особисті нагадування ----------
+async def tick(ctx: ContextTypes.DEFAULT_TYPE):
+    now_dt = datetime.now(KYIV)
+    t, now = now_dt.date(), now_dt.hour * 60 + now_dt.minute
+    if now_dt.hour == 4 and now_dt.minute == 0:
+        store.cleanup((t - timedelta(days=2)).isoformat())
+    td, tm = store.get_day(t.isoformat()), store.get_day(posts.tomorrow(t).isoformat())
+    if not any(td.values()) and not any(tm.values()):
+        return
+    tl = posts.timeline(td, tm)
+    for at, event in sorted(posts.switch_events(tl).items()):
+        day = (t + timedelta(days=at // 1440)).isoformat()
+        key = f"{day}@{posts.hhmm(at)}"
+
+        if CHANNEL_ID and at - CHANNEL_LEAD <= now < at + GRACE and store.mark_sent(f"ch:{key}", day):
+            post_id = store.get_meta(f"post:{day}")
+            try:
+                await ctx.bot.send_message(
+                    CHANNEL_ID, posts.switch_post(at, event, tl), parse_mode="HTML",
+                    reply_markup=channel_button(ctx.bot),
+                    reply_parameters=ReplyParameters(int(post_id), allow_sending_without_reply=True)
+                    if post_id else None)
+            except TelegramError:
+                log.exception("Не вдалося надіслати пост про перемикання")
+
+        for q, end in event["off"].items():
+            if at - REMIND_LEAD <= now < at + GRACE and store.mark_sent(f"off:{key}:{q}", day):
+                await remind(ctx.bot, q, posts.reminder_off(q, at, end, now))
+        for q in event["on"]:
+            if at <= now < at + GRACE and store.mark_sent(f"on:{key}:{q}", day):
+                nxt = next((s for s, _ in tl[q] if s > at), None)
+                await remind(ctx.bot, q, posts.reminder_on(q, at, nxt))
+
+
+async def remind(bot, queue: str, text: str):
+    for uid in store.subscribers(queue):
+        if store.reminders_on(uid):
+            await send_safe(bot, uid, text)
+            await asyncio.sleep(0.05)
+
+
+# ---------- для адмінів каналу ----------
+async def channel_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     msg = update.effective_message
     if not CHANNEL_ID:
         await msg.reply_text("CHANNEL_ID не задано.")
-        return
+        return False
     try:
         member = await ctx.bot.get_chat_member(CHANNEL_ID, update.effective_user.id)
     except TelegramError as e:
         await msg.reply_text(f"Не бачу канал: {e.message}. Бот має бути адміном каналу.")
-        return
+        return False
     if member.status not in ("creator", "administrator"):
         await msg.reply_text("Команда лише для адмінів каналу.")
-        return
+        return False
+    return True
 
-    day = today().isoformat()
-    queues = {q: store.get_slots(day, q) for q in QUEUES}
-    queues = {q: s for q, s in queues.items() if s is not None}
-    if not queues:
-        await msg.reply_text("Графіка на сьогодні ще немає в базі.")
+
+def preview_day() -> tuple[date, dict, bool]:
+    """Найближчий день з відключеннями з бази, а якщо їх немає — демо-графік на завтра."""
+    t = today()
+    for d in (posts.tomorrow(t), t):
+        queues = store.get_day(d.isoformat())
+        if any(queues.values()):
+            return d, queues, False
+    return posts.tomorrow(t), posts.DEMO, True
+
+
+async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показує адміну в особистих, як виглядатимуть пости. У канал нічого не йде."""
+    if not await channel_admin(update, ctx):
         return
-    text = "🧪 <i>Тестовий пост</i>\n\n" + await channel_text(ctx.bot, day, queues)
-    try:
-        await ctx.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-    except TelegramError as e:
-        await msg.reply_text(f"Канал відхилив пост: {e.message}")
+    d, queues, demo = preview_day()
+    note = "🧪 <i>Прев'ю на демо-даних — реальних відключень зараз немає</i>\n\n" if demo else \
+           "🧪 <i>Прев'ю</i>\n\n"
+    chat = update.effective_chat.id
+    await publish_day(ctx.bot, chat, d, queues, prefix=note, remember=False)
+    await publish_day(ctx.bot, chat, d, queues, changed={"3.2", "5.1"} if demo else None,
+                      prefix=note, remember=False)
+    tl = posts.timeline({}, queues) if d != today() else posts.timeline(queues, {})
+    events = posts.switch_events(tl)
+    if events:
+        at = min(events, key=lambda a: (-len(events[a]["off"]) - len(events[a]["on"]), a))
+        await ctx.bot.send_message(chat, note + posts.switch_post(at, events[at], tl), parse_mode="HTML")
+        q, end = next(iter(events[at]["off"].items()), (None, None))
+        if q:
+            await ctx.bot.send_message(chat, note + posts.reminder_off(q, at, end, at - 30),
+                                       parse_mode="HTML", reply_markup=reminders_keyboard(chat))
+
+
+async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Тестовий пост у канал. Доступний лише адмінам каналу."""
+    if not await channel_admin(update, ctx):
         return
-    await msg.reply_text("Надіслав тестовий пост у канал.")
+    d, queues, demo = preview_day()
+    note = "🧪 <i>Тестовий пост" + (" на демо-даних" if demo else "") + "</i>\n\n"
+    await publish_day(ctx.bot, CHANNEL_ID, d, queues, prefix=note, remember=False)
+    await update.effective_message.reply_text("Надіслав тестовий пост у канал.")
 
 
 async def post_init(app: Application):
@@ -359,6 +456,8 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
+    app.add_handler(CommandHandler("preview", cmd_preview))
+    app.add_handler(CallbackQueryHandler(on_reminders, pattern=r"^rem:"))
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_street, pattern=r"^s:"))
@@ -366,6 +465,7 @@ def main():
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=10)
+    app.job_queue.run_repeating(tick, interval=60, first=30)
     app.run_polling()
 
 
