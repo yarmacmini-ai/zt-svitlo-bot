@@ -530,6 +530,7 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 await ctx.bot.send_message(
                     CHANNEL_ID, posts.switch_post(at, event, tl), parse_mode="HTML",
+                    disable_notification=True,  # щопівгодини — без звуку, картки графіка зі звуком
                     reply_markup=channel_button(ctx.bot),
                     reply_parameters=ReplyParameters(int(post_id), allow_sending_without_reply=True)
                     if post_id else None)
