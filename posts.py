@@ -180,7 +180,7 @@ def _until(t: int, base: int) -> str:
 
 
 def switch_post(t: int, event: dict, tl: dict[str, list[list[int]]]) -> str:
-    lines = [f"⚡️ <b>О {hhmm(t)}</b> · Житомир", ""]
+    lines = [f"⚡️ <b>О {hhmm(t)}</b> · Житомирщина", ""]
     if event["off"]:
         lines.append("🔴 <b>Вимикаємо</b>")
         by_end: dict[int, list[str]] = {}

@@ -4,3 +4,4 @@ discovery/
 __pycache__/
 .venv/
 .git/
+tests/

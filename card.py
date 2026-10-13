@@ -81,7 +81,7 @@ def render(title: str, subtitle: str, queues: dict, *, updated: str | None = Non
 
     # --- шапка ---
     _bolt(d, PAD, 58, 34)
-    d.text((PAD + 48, 75), "ЖИТОМИР · ГРАФІК ВІДКЛЮЧЕНЬ", font=font(26, 700), fill=MUTED, anchor="lm")
+    d.text((PAD + 48, 75), "ЖИТОМИРЩИНА · ГРАФІК ВІДКЛЮЧЕНЬ", font=font(26, 700), fill=MUTED, anchor="lm")
     if updated:
         label = f"ОНОВЛЕНО {updated}"
         f = font(24, 800)

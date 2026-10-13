@@ -1,4 +1,4 @@
-"""Бот графіків відключень Житомира.
+"""Бот графіків відключень Житомирщини (графік один на всю область, черги 1.1–6.2).
 
 Користувач знаходить свою чергу (1.1–6.2) за адресою і отримує повідомлення,
 коли графік черги з'являється або змінюється, а також нагадування за 30 хв до
@@ -87,11 +87,11 @@ def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
 
 
 HELP = ("<b>Як це працює</b>\n\n"
-        "1. Знайдіть свою чергу: напишіть адресу, наприклад <i>Київська 24</i>, "
-        "або оберіть чергу вручну.\n"
+        "1. Знайдіть свою чергу: напишіть адресу — <i>Київська 24</i> у Житомирі, "
+        "<i>Бердичів, Житомирська 12</i> чи просто назву села. Або оберіть чергу вручну.\n"
         "2. Я напишу, коли для вашої черги з'явиться або зміниться графік.\n"
         "3. За 30 хв до вимкнення нагадаю, а коли світло має повернутись — повідомлю.\n\n"
-        "Можна стежити за кількома адресами: дім, робота, батьки.\n\n"
+        "Графік один для всієї області. Можна стежити за кількома адресами: дім, робота, батьки.\n\n"
         "Дані — з сайту Житомиробленерго, перевіряю кожні 10 хвилин.")
 
 
@@ -99,8 +99,10 @@ MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔎 Знайти чергу за адресою", callback_data="menu:addr")],
     [InlineKeyboardButton("Я знаю свою чергу", callback_data="menu:pick")],
 ])
-ASK_ADDRESS = ("Напишіть вулицю і номер будинку в Житомирі, наприклад:\n"
-               "<i>Київська 24</i>")
+ASK_ADDRESS = ("Напишіть адресу на Житомирщині:\n"
+               "• у Житомирі — вулицю й будинок: <i>Київська 24</i>\n"
+               "• в іншому місті чи селі — через кому: <i>Бердичів, Житомирська 12</i>\n"
+               "• або просто назву села: <i>Березівка</i>")
 SITE_DOWN = ("Сайт Житомиробленерго зараз не відповідає, тож адресу перевірити не можу. "
              "Спробуйте пізніше або оберіть чергу вручну.")
 
@@ -109,7 +111,7 @@ SITE_DOWN = ("Сайт Житомиробленерго зараз не відп
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     mine = store.user_queues(update.effective_user.id)
-    text = ("Я надсилаю графік відключень світла у Житомирі лише для вашої черги — "
+    text = ("Я надсилаю графік відключень світла на Житомирщині лише для вашої черги — "
             "і лише коли він з'являється або змінюється. Без зайвих повідомлень.\n\n")
     text += (f"Ваші черги: <b>{', '.join(mine)}</b>. Додати ще одну адресу?"
              if mine else "Спершу знайдемо вашу чергу. Можна просто написати адресу.")
@@ -168,42 +170,145 @@ async def on_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_reply_markup(queues_keyboard(query.from_user.id))
 
 
-# ---------- пошук черги за адресою ----------
+# ---------- пошук черги за адресою (вся область) ----------
+HOUSE = re.compile(r"\d+[\w/\-]*")
+
+
+def _place(ctx) -> tuple[str, str]:
+    return ctx.user_data.get("place") or address.ZHYTOMYR
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Будь-який текст у приваті — це адреса: «Київська 24», «Київська» або «24»."""
+    """Будь-який текст у приваті — це адреса.
+
+    «Київська 24» — вулиця в Житомирі; «Бердичів, Житомирська 12» — інший населений
+    пункт; «Березівка» — село (покажемо чергу або спитаємо вулицю); «24» — будинок.
+    """
     msg = update.effective_message
     text = (msg.text or "").strip()
-    street = ctx.user_data.get("street")
     try:
-        if street and re.fullmatch(r"\d+[\w/\-]*", text):
-            await show_house(msg, ctx, street, text)
+        await address.ensure_zhytomyr()
+        if ctx.user_data.get("street") and HOUSE.fullmatch(text):
+            await show_house(msg, ctx, ctx.user_data["street"], text)
             return
-        query, house = address.split_address(text)
-        found = await address.search_streets(query)
+        place_q, rest = address.split_place(text)
+        if place_q and not HOUSE.fullmatch(rest):  # «Київська, 24» — це вулиця з будинком
+            found, _ = await address.search_places(place_q)
+            if not found:
+                await msg.reply_text(
+                    f"Не знайшов населений пункт «{place_q}» на Житомирщині. "
+                    "Перевірте назву, наприклад: <i>Бердичів, Житомирська 12</i>.",
+                    parse_mode="HTML", reply_markup=MENU)
+                return
+            ctx.user_data["pending"] = rest
+            await choose_place(msg, ctx, found)
+            return
+
+        query, house = address.split_address(text.replace(",", " "))
+        found = await address.search_streets(query, *_place(ctx))
+        # Без номера будинку це може бути назва села чи міста — навіть посеред пошуку в іншому.
+        places, exact = ([], False) if house else await address.search_places(query)
+        if exact or (not found and places):
+            ctx.user_data.pop("street", None)
+            await choose_place(msg, ctx, places)
+            return
     except (httpx.HTTPError, ValueError):
         log.exception("Пошук адреси на сайті обленерго не вдався")
         await msg.reply_text(SITE_DOWN, reply_markup=MENU)
         return
 
     if not found:
+        where = (await address.find_place(*_place(ctx)) or {}).get("name", "населеному пункті")
         await msg.reply_text(
-            f"Не знайшов вулицю «{query}» у Житомирі. Спробуйте лише назву, без «вул.», "
-            "наприклад: <i>Київська</i>. Або оберіть чергу вручну.",
-            parse_mode="HTML", reply_markup=MENU)
+            f"Не знайшов вулицю «{query}» ({where}). Спробуйте лише назву, без «вул.».\n\n"
+            "Інше місто чи село — напишіть так: <i>Бердичів, Житомирська 12</i>, "
+            "або просто назву села.", parse_mode="HTML", reply_markup=MENU)
         return
     ctx.user_data["house"] = house
+    await choose_street(msg, ctx, found)
+
+
+async def choose_place(msg, ctx, places: list[dict]):
+    if len(places) == 1:
+        await pick_place(msg, ctx, places[0])
+        return
+    buttons = [[InlineKeyboardButton(address.place_label(p), callback_data=f"c:{p['rem']}:{p['id']}")]
+               for p in places]
+    await msg.reply_text("Який саме населений пункт?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def choose_street(msg, ctx, found: list[tuple[str, str]]):
+    rem, cid = _place(ctx)
     if len(found) == 1:
         await pick_street(msg, ctx, found[0][0])
         return
-    buttons = [[InlineKeyboardButton(name, callback_data=f"s:{sid}")] for sid, name in found]
+    buttons = [[InlineKeyboardButton(name, callback_data=f"s:{rem}:{cid}:{sid}")] for sid, name in found]
     await msg.reply_text("Яка саме вулиця?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def on_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, rem, cid = query.data.split(":")
+    try:
+        await pick_place(query.message, ctx, await address.find_place(rem, cid))
+    except (httpx.HTTPError, ValueError):
+        log.exception("Пошук адреси на сайті обленерго не вдався")
+        await query.message.reply_text(SITE_DOWN, reply_markup=MENU)
+
+
+async def pick_place(msg, ctx, p: dict):
+    rem, cid = p["rem"], p["id"]
+    ctx.user_data["place"] = (rem, cid)
+    ctx.user_data.pop("street", None)
+    label = address.place_label(p)
+    pending = ctx.user_data.pop("pending", None)
+    if pending:  # «Бердичів, Житомирська 12» — вулицю вже написали
+        query, house = address.split_address(pending)
+        found = await address.search_streets(query, rem, cid)
+        if found:
+            ctx.user_data["house"] = house
+            await choose_street(msg, ctx, found)
+            return
+        await msg.reply_text(f"У {label} не знайшов вулицю «{query}». Напишіть лише назву вулиці.")
+        return
+
+    records = await address.place_records(rem, cid)
+    again = InlineKeyboardButton("🔎 Інша адреса", callback_data="menu:addr")
+    if records is not None:
+        queues = address.place_queues(records)
+        if not queues:
+            await msg.reply_text(f"📍 {label}\nЦей населений пункт не відключають за графіками — "
+                                 "лише у разі аварій.", reply_markup=InlineKeyboardMarkup([[again]]))
+            return
+        if len(queues) == 1 and all(r["queue"] == queues[0] for r in records):
+            ctx.user_data.pop("place", None)
+            await msg.reply_text(
+                f"📍 {label}\nЧерга для всього населеного пункту: <b>{queues[0]}</b>",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(f"✅ Підписатися на {queues[0]}", callback_data=f"sub:{queues[0]}")],
+                     [again]]))
+            return
+    streets = await address.streets(rem, cid)
+    if 0 < len(streets) <= 12:
+        buttons = [[InlineKeyboardButton(name, callback_data=f"s:{rem}:{cid}:{sid}")] for sid, name in streets]
+        await msg.reply_text(f"📍 {label}\nЯка вулиця?", reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await msg.reply_text(f"📍 {label}\nНапишіть вулицю і номер будинку, наприклад: "
+                             "<i>Шевченка 5</i>", parse_mode="HTML")
 
 
 async def on_street(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    parts = query.data.split(":")
+    if len(parts) == 4:  # s:rem:cid:street
+        ctx.user_data["place"] = (parts[1], parts[2])
+    else:                # старі кнопки s:street — Житомир
+        ctx.user_data.pop("place", None)
     try:
-        await pick_street(query.message, ctx, query.data.split(":", 1)[1])
+        await address.ensure_zhytomyr()
+        await pick_street(query.message, ctx, parts[-1])
     except (httpx.HTTPError, ValueError):
         log.exception("Пошук адреси на сайті обленерго не вдався")
         await query.message.reply_text(SITE_DOWN, reply_markup=MENU)
@@ -215,35 +320,48 @@ async def pick_street(msg, ctx, street_id: str):
     if house:
         await show_house(msg, ctx, street_id, house)
     else:
-        name = await address.street_name(street_id)
+        name = await address.street_name(*_place(ctx), street_id)
         await msg.reply_text(f"{name}. Який номер будинку?")
 
 
+async def address_label(ctx, street: str, house: str) -> str:
+    rem, cid = _place(ctx)
+    if (rem, cid) == address.ZHYTOMYR:
+        return f"{street}, {house}"
+    p = await address.find_place(rem, cid)
+    return f"{p['name'] if p else ''}, {street}, {house}"
+
+
 async def show_house(msg, ctx, street_id: str, house: str):
-    name = await address.street_name(street_id)
-    records = await address.street_records(street_id)
+    rem, cid = _place(ctx)
+    name = await address.street_name(rem, cid, street_id)
+    records = await address.street_records(rem, cid, street_id)
     hits = address.find_house(records, house)
     again = InlineKeyboardButton("🔎 Інша адреса", callback_data="menu:addr")
+    label = await address_label(ctx, name, house)
 
     if not hits:
         queues = sorted({r["queue"] for r in records if r["queue"]})
         buttons = [[InlineKeyboardButton(f"Підписатися на {q}", callback_data=f"sub:{q}")]
                    for q in queues]
+        where = await address_label(ctx, name, house)
         await msg.reply_text(
-            f"Будинку {house} немає в списку обленерго для «{name}». Напишіть інший номер"
-            + (f" або оберіть чергу — на цій вулиці є: {', '.join(queues)}." if queues else "."),
+            f"Будинку немає в списку обленерго: {where}. Напишіть інший номер"
+            + (f" або оберіть чергу — на цій вулиці є: {', '.join(queues)}." if queues else ".")
+            + "\n\nІнше місто чи село — «🔎 Інша адреса».",
             reply_markup=InlineKeyboardMarkup(buttons + [[again]]))
         return
 
     queues = list(dict.fromkeys(r["queue"] for r in hits if r["queue"]))
     if not queues:
         await msg.reply_text(
-            f"📍 {name}, {house}\nЦей будинок не відключають за графіками — "
+            f"📍 {label}\nЦей будинок не відключають за графіками — "
             "лише у разі аварій. Підписуватися не потрібно.",
             reply_markup=InlineKeyboardMarkup([[again]]))
         return
-    ctx.user_data.pop("street", None)
-    lines = [f"📍 {name}, {house}"]
+    for key in ("street", "place"):
+        ctx.user_data.pop(key, None)
+    lines = [f"📍 {label}"]
     if len(queues) == 1:
         lines.append(f"Ваша черга: <b>{queues[0]}</b>")
     else:  # різні черги для побутових і юридичних споживачів
@@ -425,6 +543,14 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE):
             if at <= now < at + GRACE and store.mark_sent(f"on:{key}:{q}", day):
                 nxt = next((s for s, _ in tl[q] if s > at), None)
                 await remind(ctx.bot, q, posts.reminder_on(q, at, nxt))
+
+
+async def warm_places(ctx: ContextTypes.DEFAULT_TYPE):
+    """Список ~1760 населених пунктів — 20 запитів до сайту; тягнемо заздалегідь, не під час діалогу."""
+    try:
+        log.info("Населених пунктів у пошуку: %d", len(await address.settlements()))
+    except (httpx.HTTPError, ValueError):
+        log.exception("Не вдалося завантажити населені пункти")
 
 
 async def remind(bot, queue: str, text: str):
@@ -649,11 +775,13 @@ def main():
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_street, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(on_place, pattern=r"^c:"))
     app.add_handler(CallbackQueryHandler(on_subscribe, pattern=r"^sub:"))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=10)
     app.job_queue.run_repeating(tick, interval=60, first=30)
+    app.job_queue.run_repeating(warm_places, interval=12 * 3600, first=20)
     app.run_polling()
 
 
