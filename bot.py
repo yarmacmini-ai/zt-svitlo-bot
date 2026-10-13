@@ -16,10 +16,10 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyParameters, Update)
+                      KeyboardButton, ReplyKeyboardMarkup, ReplyParameters, Update)
 from telegram.error import Forbidden, RetryAfter, TelegramError
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
+                          CommandHandler, ContextTypes, MessageHandler, filters)
 
 import address
 import card
@@ -72,6 +72,29 @@ def reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
         callback_data="rem:off" if on else "rem:on")]])
 
 
+BTN_FIND, BTN_MY, BTN_QUEUES = "🔎 Знайти чергу за адресою", "📅 Мій графік", "🔢 Мої черги"
+BTN_REMIND, BTN_HELP = "⏰ Нагадування", "❓ Допомога"
+BTN_POST, BTN_CARD = "📢 Новий пост", "🖼 Графік у канал"
+MENU_BUTTONS = {BTN_FIND, BTN_MY, BTN_QUEUES, BTN_REMIND, BTN_HELP, BTN_POST, BTN_CARD}
+
+
+def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
+    rows = [[BTN_FIND], [BTN_MY, BTN_QUEUES], [BTN_REMIND, BTN_HELP]]
+    if admin:
+        rows.append([BTN_POST, BTN_CARD])
+    return ReplyKeyboardMarkup([[KeyboardButton(b) for b in r] for r in rows],
+                               resize_keyboard=True, is_persistent=True)
+
+
+HELP = ("<b>Як це працює</b>\n\n"
+        "1. Знайдіть свою чергу: напишіть адресу, наприклад <i>Київська 24</i>, "
+        "або оберіть чергу вручну.\n"
+        "2. Я напишу, коли для вашої черги з'явиться або зміниться графік.\n"
+        "3. За 30 хв до вимкнення нагадаю, а коли світло має повернутись — повідомлю.\n\n"
+        "Можна стежити за кількома адресами: дім, робота, батьки.\n\n"
+        "Дані — з сайту Житомиробленерго, перевіряю кожні 10 хвилин.")
+
+
 MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔎 Знайти чергу за адресою", callback_data="menu:addr")],
     [InlineKeyboardButton("Я знаю свою чергу", callback_data="menu:pick")],
@@ -90,7 +113,38 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "і лише коли він з'являється або змінюється. Без зайвих повідомлень.\n\n")
     text += (f"Ваші черги: <b>{', '.join(mine)}</b>. Додати ще одну адресу?"
              if mine else "Спершу знайдемо вашу чергу. Можна просто написати адресу.")
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=MENU)
+    admin = await is_channel_admin(ctx.bot, update.effective_user.id)
+    text += "\n\nКнопки меню — внизу 👇"
+    await update.effective_message.reply_text(text, parse_mode="HTML",
+                                              reply_markup=main_keyboard(admin))
+
+
+async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопки постійного меню внизу чату."""
+    msg, uid = update.effective_message, update.effective_user.id
+    ctx.user_data.pop("compose", None)
+    btn = msg.text
+    if btn == BTN_FIND:
+        ctx.user_data.clear()
+        await msg.reply_text(ASK_ADDRESS, parse_mode="HTML")
+    elif btn == BTN_MY:
+        await cmd_my(update, ctx)
+    elif btn == BTN_QUEUES:
+        await msg.reply_text("Ваші черги позначені ✅. Натисніть, щоб додати або прибрати.",
+                             reply_markup=queues_keyboard(uid))
+    elif btn == BTN_REMIND:
+        on = store.reminders_on(uid)
+        await msg.reply_text(
+            "⏰ Нагадування за 30 хв до вимкнення і в момент увімкнення: "
+            f"<b>{'увімкнено' if on else 'вимкнено'}</b>.\n"
+            "Про зміни графіка я пишу завжди.", parse_mode="HTML",
+            reply_markup=reminders_keyboard(uid))
+    elif btn == BTN_HELP:
+        await msg.reply_text(HELP, parse_mode="HTML", reply_markup=MENU)
+    elif btn == BTN_POST:
+        await start_compose(update, ctx)
+    elif btn == BTN_CARD:
+        await cmd_preview(update, ctx)
 
 
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -333,9 +387,10 @@ async def publish_day(bot, chat_id, d: date, queues: dict, *, changed: set | Non
             if prev else None)
     except TelegramError:
         log.exception("Не вдалося опублікувати графік у %s", chat_id)
-        return
+        return None
     if remember:
         store.set_meta(f"post:{d.isoformat()}", str(msg.message_id))
+    return msg
 
 
 # ---------- перемикання за графіком: пости в канал і особисті нагадування ----------
@@ -380,6 +435,16 @@ async def remind(bot, queue: str, text: str):
 
 
 # ---------- для адмінів каналу ----------
+async def is_channel_admin(bot, user_id: int) -> bool:
+    if not CHANNEL_ID:
+        return False
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+    except TelegramError:
+        return False
+    return member.status in ("creator", "administrator")
+
+
 async def channel_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     msg = update.effective_message
     if not CHANNEL_ID:
@@ -426,6 +491,113 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if q:
             await ctx.bot.send_message(chat, note + posts.reminder_off(q, at, end, at - 30),
                                        parse_mode="HTML", reply_markup=reminders_keyboard(chat))
+    if demo:
+        await ctx.bot.send_message(chat, "Реальних відключень у базі немає — публікувати нічого. "
+                                         "Ручний пост: «📢 Новий пост».")
+        return
+    await ctx.bot.send_message(
+        chat, f"Опублікувати графік {posts.day_inline(d, today())} у канал?\n"
+              "Піде перша картка (без «оновлено»), як у прев'ю.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Опублікувати", callback_data=f"card:{d.isoformat()}"),
+            InlineKeyboardButton("❌ Ні", callback_data="card:no")]]))
+
+
+async def on_card_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(None)
+    if query.data == "card:no" or not await channel_admin(update, ctx):
+        return
+    d = date.fromisoformat(query.data.split(":", 1)[1])
+    queues = store.get_day(d.isoformat())
+    msg = await publish_day(ctx.bot, CHANNEL_ID, d, queues, remember=False)
+    await query.message.reply_text(f"✅ Опубліковано: {post_link(msg)}" if msg else
+                                   "Канал відхилив пост — деталі в логах Railway.")
+
+
+def post_link(msg) -> str:
+    """Посилання на пост у каналі: t.me/<username>/N або t.me/c/<id>/N для закритого каналу."""
+    chat = msg.chat
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{msg.message_id}"
+    return f"https://t.me/c/{str(chat.id).removeprefix('-100')}/{msg.message_id}"
+
+
+# ---------- ручні пости в канал ----------
+def compose_keyboard(with_button: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опублікувати в канал", callback_data="post:pub")],
+        [InlineKeyboardButton(("✅" if with_button else "⬜️") + " Кнопка «Сповіщення для моєї черги»",
+                              callback_data="post:btn")],
+        [InlineKeyboardButton("✏️ Інший варіант", callback_data="post:again"),
+         InlineKeyboardButton("❌ Скасувати", callback_data="post:cancel")],
+    ])
+
+
+async def start_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await channel_admin(update, ctx):
+        return
+    ctx.user_data["compose"] = True
+    await update.effective_message.reply_text(
+        "📢 Надішліть пост одним повідомленням: текст, фото чи відео з підписом. "
+        "Форматування (жирний, посилання, цитати) збережеться.\n\n"
+        "Я покажу, як він виглядатиме в каналі, і попрошу підтвердити.")
+
+
+async def on_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ловить чернетку поста, поки адмін у режимі «Новий пост». Інакше пропускає далі."""
+    msg = update.effective_message
+    if not ctx.user_data.get("compose") or msg.text in MENU_BUTTONS:
+        return
+    ctx.user_data["compose"] = False
+    with_button = ctx.user_data.setdefault("post_btn", True)
+    preview = await ctx.bot.copy_message(
+        msg.chat_id, msg.chat_id, msg.message_id,
+        reply_markup=channel_button(ctx.bot) if with_button else None)
+    ctx.user_data["draft"] = (msg.chat_id, msg.message_id, preview.message_id)
+    await msg.reply_text("👆 Так пост виглядатиме в каналі.",
+                         reply_markup=compose_keyboard(with_button))
+    raise ApplicationHandlerStop
+
+
+async def on_post_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    draft = ctx.user_data.get("draft")
+    if action in ("pub", "btn") and not draft:
+        await query.answer("Чернетку не знайдено — почніть заново: «📢 Новий пост»", show_alert=True)
+        return
+    if action == "btn":
+        with_button = not ctx.user_data.get("post_btn", True)
+        ctx.user_data["post_btn"] = with_button
+        chat_id, _, preview_id = draft
+        await ctx.bot.edit_message_reply_markup(
+            chat_id, preview_id, reply_markup=channel_button(ctx.bot) if with_button else None)
+        await query.edit_message_reply_markup(compose_keyboard(with_button))
+        await query.answer()
+        return
+    await query.answer()
+    await query.edit_message_reply_markup(None)
+    if action == "again":
+        await start_compose(update, ctx)
+    elif action == "cancel":
+        ctx.user_data.pop("draft", None)
+        await query.message.reply_text("Скасовано, у канал нічого не пішло.")
+    elif action == "pub":
+        if not await channel_admin(update, ctx):
+            return
+        chat_id, message_id, _ = draft
+        try:
+            sent = await ctx.bot.copy_message(
+                CHANNEL_ID, chat_id, message_id,
+                reply_markup=channel_button(ctx.bot) if ctx.user_data.get("post_btn", True) else None)
+        except TelegramError as e:
+            await query.message.reply_text(f"Канал відхилив пост: {e.message}")
+            return
+        ctx.user_data.pop("draft", None)
+        link = f"https://t.me/c/{str(CHANNEL_ID).removeprefix('-100')}/{sent.message_id}"
+        await query.message.reply_text(f"✅ Опубліковано: {link}")
 
 
 async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -466,6 +638,13 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("testpost", cmd_testpost))
     app.add_handler(CommandHandler("preview", cmd_preview))
+    app.add_handler(CommandHandler("post", start_compose))
+    # Чернетка ручного поста перехоплюється раніше за пошук адреси (група -1).
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_compose), group=-1)
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.Text(list(MENU_BUTTONS)), on_menu_button))
+    app.add_handler(CallbackQueryHandler(on_card_publish, pattern=r"^card:"))
+    app.add_handler(CallbackQueryHandler(on_post_action, pattern=r"^post:"))
     app.add_handler(CallbackQueryHandler(on_reminders, pattern=r"^rem:"))
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^menu:"))
