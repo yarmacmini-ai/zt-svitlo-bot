@@ -17,6 +17,7 @@ import posts  # noqa: E402
 T, TM = date(2026, 10, 13), date(2026, 10, 14)
 CH, ADMIN, USER = "-1003948683401", 7, 8
 sent = []
+silent: dict = {}
 
 
 # ---------- фейковий Telegram ----------
@@ -50,6 +51,7 @@ class FakeBot:
 
     async def send_message(self, cid, text, reply_markup=None, reply_parameters=None, **k):
         sent.append(("msg", cid, text, reply_parameters and reply_parameters.message_id))
+        silent[cid] = k.get("disable_notification", False)
         if cid == CH and ("Вимикаємо" in text or "Вмикаємо" in text):
             assert k.get("disable_notification"), "пости перемикань — без звуку"
         return self._msg(cid)
@@ -58,6 +60,11 @@ class FakeBot:
         assert photo[:4] == b"\x89PNG" and len(caption) <= 1024
         sent.append(("photo", cid, caption, reply_parameters and reply_parameters.message_id))
         return self._msg(cid)
+
+    async def edit_message_media(self, media, chat_id=None, message_id=None, reply_markup=None):
+        assert media.media and len(media.caption) <= 1024
+        sent.append(("edit_media", chat_id, media.caption, message_id))
+        return Msg(chat=chat_id, mid=message_id)
 
     async def copy_message(self, to, frm, mid, reply_markup=None):
         sent.append(("copy", to, mid, bool(reply_markup)))
@@ -110,6 +117,7 @@ def test_posts():
 
 # ---------- розсилка, канал, перемикання ----------
 async def test_flow():
+    bot.store.set_meta("mode", "hard")
     at(T, 12, 0)
     bot.store.toggle(1, "2.1"); bot.store.toggle(2, "5.2"); bot.store.set_reminders(2, False)
     sched = {T.isoformat(): {q: [] for q in posts.QUEUES}}
@@ -187,9 +195,46 @@ async def test_menu_and_posts():
     sent.clear()
 
 
+async def test_light():
+    """Легкий режим: тихе повідомлення раз на день, редагування поста, без перемикань."""
+    bot.store.set_meta("mode", "light")
+    D = date(2026, 10, 25)
+    at(date(2026, 10, 24), 12, 0)
+    bot.store.toggle(3, "2.1")
+    sched = {D.isoformat(): dict(posts.DEMO)}
+
+    async def src(): return sched
+    bot.source.fetch = src
+    await bot.poll(Ctx)
+    photo = next(x for x in sent if x[0] == "photo")
+    assert "можливих відключень" in photo[2] and "сподіваємось" in photo[2], photo[2]
+    personal = [x for x in sent if x[0] == "msg" and x[1] == 3]
+    assert len(personal) == 1 and "можливі відключення" in personal[0][2] and silent[3], personal
+    post_id = bot.store.get_meta(f"post:{D.isoformat()}")
+    sent.clear()
+
+    sched[D.isoformat()] = dict(posts.DEMO, **{"2.1": [("17:00", "21:00")]})
+    await bot.poll(Ctx)
+    assert [x[0] for x in sent] == ["edit_media"], sent  # той самий пост, без нових повідомлень
+    assert sent[0][3] == int(post_id) and "Оновлено о" in sent[0][2]
+    sent.clear()
+
+    at(D, 16, 30)
+    await bot.tick(Ctx)
+    assert not sent, "у легкому режимі — без перемикань і нагадувань"
+
+    Ctx.user_data = {}
+    await bot.on_mode(Upd(data="mode:hard", uid=USER), Ctx)
+    assert bot.light_mode() and "лише для адмінів" in sent[-1][2]
+    await bot.on_mode(Upd(data="mode:hard"), Ctx)
+    assert not bot.light_mode() and "Жорсткий" in sent[-1][2]
+    sent.clear()
+
+
 async def main():
     test_posts()
     await test_flow()
+    await test_light()
     await test_catchup()
     await test_menu_and_posts()
     print("OK")
