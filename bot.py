@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
-                      KeyboardButton, ReplyKeyboardMarkup, ReplyParameters, Update)
+                      InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, ReplyParameters,
+                      Update)
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
                           CommandHandler, ContextTypes, MessageHandler, filters)
@@ -49,6 +50,13 @@ def today() -> date:
     return datetime.now(KYIV).date()
 
 
+def light_mode() -> bool:
+    """Легкий режим (за замовчуванням): графік обленерго подаємо як «можливі відключення»,
+    без постів перемикань і нагадувань — поки їх фактично не застосовують. Жорсткий
+    вмикає адмін у боті, коли відключення реальні."""
+    return store.get_meta("mode") != "hard"
+
+
 SOURCE = os.getenv("SOURCE", "demo")
 store = Store(os.getenv("DB_PATH", "svitlo.db"))
 source = make_source(SOURCE)
@@ -74,14 +82,14 @@ def reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 BTN_FIND, BTN_MY, BTN_QUEUES = "🔎 Знайти чергу за адресою", "📅 Мій графік", "🔢 Мої черги"
 BTN_REMIND, BTN_HELP = "⏰ Нагадування", "❓ Допомога"
-BTN_POST, BTN_CARD = "📢 Новий пост", "🖼 Графік у канал"
-MENU_BUTTONS = {BTN_FIND, BTN_MY, BTN_QUEUES, BTN_REMIND, BTN_HELP, BTN_POST, BTN_CARD}
+BTN_POST, BTN_CARD, BTN_MODE = "📢 Новий пост", "🖼 Графік у канал", "⚙️ Режим"
+MENU_BUTTONS = {BTN_FIND, BTN_MY, BTN_QUEUES, BTN_REMIND, BTN_HELP, BTN_POST, BTN_CARD, BTN_MODE}
 
 
 def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
     rows = [[BTN_FIND], [BTN_MY, BTN_QUEUES], [BTN_REMIND, BTN_HELP]]
     if admin:
-        rows.append([BTN_POST, BTN_CARD])
+        rows += [[BTN_POST, BTN_CARD], [BTN_MODE]]
     return ReplyKeyboardMarkup([[KeyboardButton(b) for b in r] for r in rows],
                                resize_keyboard=True, is_persistent=True)
 
@@ -90,7 +98,9 @@ HELP = ("<b>Як це працює</b>\n\n"
         "1. Знайдіть свою чергу: напишіть адресу — <i>Київська 24</i> у Житомирі, "
         "<i>Бердичів, Житомирська 12</i> чи просто назву села. Або оберіть чергу вручну.\n"
         "2. Я напишу, коли для вашої черги з'явиться або зміниться графік.\n"
-        "3. За 30 хв до вимкнення нагадаю, а коли світло має повернутись — повідомлю.\n\n"
+        "3. Коли відключення реально застосовують — нагадаю за 30 хв до вимкнення "
+        "і повідомлю, коли світло має повернутись. Поки графіки діють «про всяк випадок», "
+        "пишу не частіше разу на день і без звуку.\n\n"
         "Графік один для всієї області. Можна стежити за кількома адресами: дім, робота, батьки.\n\n"
         "Дані — з сайту Житомиробленерго, перевіряю кожні 10 хвилин.")
 
@@ -134,6 +144,12 @@ async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif btn == BTN_QUEUES:
         await msg.reply_text("Ваші черги позначені ✅. Натисніть, щоб додати або прибрати.",
                              reply_markup=queues_keyboard(uid))
+    elif btn == BTN_REMIND and light_mode():
+        await msg.reply_text(
+            "⏰ Зараз нагадування на паузі для всіх: графіки обленерго застосовують не завжди, "
+            "і ми не хочемо турбувати даремно. Щойно відключення стануть реальними — "
+            "нагадуватиму за 30 хв до вимкнення.\n\nВаше налаштування:",
+            reply_markup=reminders_keyboard(uid))
     elif btn == BTN_REMIND:
         on = store.reminders_on(uid)
         await msg.reply_text(
@@ -147,6 +163,8 @@ async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await start_compose(update, ctx)
     elif btn == BTN_CARD:
         await cmd_preview(update, ctx)
+    elif btn == BTN_MODE:
+        await show_mode(update, ctx)
 
 
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -383,7 +401,7 @@ async def on_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(
         f"Готово! Черга <b>{queue}</b>.\n\n"
         "• Напишу, щойно для неї з'явиться або зміниться графік\n"
-        "• Нагадаю за 30 хв до вимкнення і коли світло має повернутись\n\n"
+        "• Коли відключення реально застосовують — нагадаю за 30 хв до вимкнення\n\n"
         "/my — графік на сьогодні й завтра\n/start — додати ще адресу\n/stop — відписатися",
         parse_mode="HTML", reply_markup=reminders_keyboard(uid))
 
@@ -407,8 +425,11 @@ async def cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = today()
     blocks = [posts.personal_day(q, d, t, store.get_slots(d.isoformat(), q))
               for q in queues for d in (t, posts.tomorrow(t))]
-    status = "увімкнено" if store.reminders_on(uid) else "вимкнено"
-    blocks.append(f"⏰ Нагадування за 30 хв до вимкнення: {status}")
+    if light_mode():
+        blocks.append(posts.LIGHT_NOTE + "\n⏰ Нагадування зараз на паузі для всіх.")
+    else:
+        status = "увімкнено" if store.reminders_on(uid) else "вимкнено"
+        blocks.append(f"⏰ Нагадування за 30 хв до вимкнення: {status}")
     await update.effective_message.reply_text(
         "\n\n".join(blocks), parse_mode="HTML", reply_markup=reminders_keyboard(uid))
 
@@ -423,12 +444,12 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- опитування джерела ----------
-async def send_safe(bot, chat_id, text):
+async def send_safe(bot, chat_id, text, silent: bool = False):
     try:
-        await bot.send_message(chat_id, text, parse_mode="HTML")
+        await bot.send_message(chat_id, text, parse_mode="HTML", disable_notification=silent)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        await bot.send_message(chat_id, text, parse_mode="HTML")
+        await bot.send_message(chat_id, text, parse_mode="HTML", disable_notification=silent)
     except Forbidden:  # користувач заблокував бота
         store.unsubscribe_all(chat_id)
     except TelegramError:  # одна невдала відправка не має зупиняти розсилку
@@ -462,22 +483,31 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
             # День з відключеннями, по якому ще не було картки (напр. графік з'явився до
             # оновлення бота) — публікуємо один раз, без «оновлено».
             if CHANNEL_ID and any(schedule[day].values()) and not store.get_meta(f"post:{day}"):
-                await publish_day(bot, CHANNEL_ID, date.fromisoformat(day), schedule[day])
+                await publish_day(bot, CHANNEL_ID, date.fromisoformat(day), schedule[day],
+                                  light=light_mode())
             continue
         log.info("%s: змінились черги %s", day, changed)
 
-        d = date.fromisoformat(day)
+        d, light = date.fromisoformat(day), light_mode()
         for q in changed:
-            text = posts.personal_change(q, d, t, schedule[day][q], before.get(q))
+            slots = schedule[day][q]
+            if light:
+                # Одне тихе повідомлення на чергу за день; подальші зміни — лише в /my.
+                if not slots or not store.mark_sent(f"pday:{day}:{q}", day):
+                    continue
+                text, silent = posts.personal_light(q, d, t, slots), True
+            else:
+                text, silent = posts.personal_change(q, d, t, slots, before.get(q)), False
             for uid in store.subscribers(q):
-                await send_safe(bot, uid, text)
+                await send_safe(bot, uid, text, silent=silent)
                 await asyncio.sleep(0.05)  # ліміти Telegram на розсилку
 
         if CHANNEL_ID:
             first = not any(before.values())  # раніше цього дня відключень не було
             await publish_day(bot, CHANNEL_ID, d, schedule[day],
                               changed=None if first else set(changed),
-                              cancelled=not first and not any(schedule[day].values()))
+                              cancelled=not first and not any(schedule[day].values()),
+                              light=light)
 
 
 def channel_button(bot) -> InlineKeyboardMarkup:
@@ -486,18 +516,34 @@ def channel_button(bot) -> InlineKeyboardMarkup:
 
 
 async def publish_day(bot, chat_id, d: date, queues: dict, *, changed: set | None = None,
-                      cancelled: bool = False, prefix: str = "", remember: bool = True):
-    """Картинка графіка + підпис. Оновлення йде відповіддю на попередній пост цього дня."""
+                      cancelled: bool = False, prefix: str = "", remember: bool = True,
+                      light: bool | None = None):
+    """Картинка графіка + підпис.
+
+    Жорсткий режим: оновлення — новим постом відповіддю на перший пост дня (зі звуком).
+    Легкий режим: оновлення редагує той самий пост — без нового повідомлення в каналі.
+    """
     t = today()
+    light = light_mode() if light is None else light
+    updated = datetime.now(KYIV).strftime("%H:%M") if changed or cancelled else None
     png = await asyncio.to_thread(  # Pillow — синхронний; не блокуємо цикл подій
-        card.render, posts.day_title(d, t), posts.card_subtitle(d, queues), queues,
-        updated=datetime.now(KYIV).strftime("%H:%M") if changed else None,
-        changed=changed or set(), footer=f"Сповіщення для вашої черги → @{bot.username}")
+        card.render, posts.day_title(d, t), posts.card_subtitle(d, queues, light), queues,
+        updated=updated, changed=changed or set(),
+        footer=f"Сповіщення для вашої черги → @{bot.username}", light=light)
     command = store.get_meta(f"cmd:{d.isoformat()}")
     caption = prefix + posts.channel_caption(d, t, queues, bot.username, changed=changed,
                                              cancelled=cancelled,
-                                             command=json.loads(command) if command else None)
+                                             command=json.loads(command) if command else None,
+                                             light=light, updated=updated)
     prev = store.get_meta(f"post:{d.isoformat()}") if remember else None
+    if light and prev:
+        try:
+            return await bot.edit_message_media(
+                InputMediaPhoto(png, caption=caption, parse_mode="HTML"),
+                chat_id=chat_id, message_id=int(prev), reply_markup=channel_button(bot))
+        except TelegramError:
+            log.exception("Не вдалося відредагувати пост %s — публікую новий", prev)
+            prev = None
     try:
         msg = await bot.send_photo(
             chat_id, png, caption=caption, parse_mode="HTML", reply_markup=channel_button(bot),
@@ -517,6 +563,8 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE):
     t, now = now_dt.date(), now_dt.hour * 60 + now_dt.minute
     if now_dt.hour == 4 and now_dt.minute == 0:
         store.cleanup((t - timedelta(days=2)).isoformat())
+    if light_mode():  # легкий режим: без постів перемикань і нагадувань
+        return
     td, tm = store.get_day(t.isoformat()), store.get_day(posts.tomorrow(t).isoformat())
     if not any(td.values()) and not any(tm.values()):
         return
@@ -611,7 +659,14 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                       prefix=note, remember=False)
     tl = posts.timeline({}, queues) if d != today() else posts.timeline(queues, {})
     events = posts.switch_events(tl)
-    if events:
+    if light_mode():
+        q = next((q for q in posts.QUEUES if queues.get(q)), None)
+        if q:
+            await ctx.bot.send_message(chat, note + posts.personal_light(q, d, today(), queues[q]),
+                                       parse_mode="HTML")
+        await ctx.bot.send_message(chat, "🟡 Зараз легкий режим: оновлення редагують той самий пост, "
+                                         "постів «О 14:00 вимикаємо» і нагадувань немає. Змінити — «⚙️ Режим».")
+    elif events:
         at = min(events, key=lambda a: (-len(events[a]["off"]) - len(events[a]["on"]), a))
         await ctx.bot.send_message(chat, note + posts.switch_post(at, events[at], tl), parse_mode="HTML")
         q, end = next(iter(events[at]["off"].items()), (None, None))
@@ -628,6 +683,47 @@ async def cmd_preview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Опублікувати", callback_data=f"card:{d.isoformat()}"),
             InlineKeyboardButton("❌ Ні", callback_data="card:no")]]))
+
+
+MODE_TEXT = {
+    True: ("🟡 <b>Легкий режим</b>\n"
+           "• Канал: одна картка на день «Графік можливих відключень», оновлення редагують той самий пост\n"
+           "• Постів «О 14:00 вимикаємо / вмикаємо» немає\n"
+           "• Бот: одне тихе повідомлення на чергу за день, без нагадувань\n"
+           "• Скрізь приписка: графіки застосовують не завжди"),
+    False: ("🔴 <b>Жорсткий режим</b>\n"
+            "• Канал: картка «Графік відключень», оновлення — новим постом зі звуком\n"
+            "• Пости «О 14:00 вимикаємо / вмикаємо» за 15 хв (без звуку)\n"
+            "• Бот: кожна зміна графіка, нагадування за 30 хв і «світло має повернутись»"),
+}
+
+
+def mode_keyboard(light: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔴 Увімкнути жорсткий — відключення реальні" if light else "🟡 Повернути легкий режим",
+        callback_data="mode:hard" if light else "mode:light")]])
+
+
+async def show_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await channel_admin(update, ctx):
+        return
+    light = light_mode()
+    await update.effective_message.reply_text(
+        "Зараз: " + MODE_TEXT[light] + "\n\nДіє, поки не перемкнете.",
+        parse_mode="HTML", reply_markup=mode_keyboard(light))
+
+
+async def on_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await channel_admin(update, ctx):
+        return
+    light = query.data == "mode:light"
+    store.set_meta("mode", "light" if light else "hard")
+    log.info("Режим змінено на %s адміном %s", "light" if light else "hard", query.from_user.id)
+    await query.edit_message_reply_markup(None)
+    await query.message.reply_text("✅ Увімкнено. " + MODE_TEXT[light], parse_mode="HTML",
+                                   reply_markup=mode_keyboard(light))
 
 
 async def on_card_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -771,6 +867,8 @@ def main():
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.Text(list(MENU_BUTTONS)), on_menu_button))
     app.add_handler(CallbackQueryHandler(on_card_publish, pattern=r"^card:"))
+    app.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:"))
+    app.add_handler(CommandHandler("mode", show_mode))
     app.add_handler(CallbackQueryHandler(on_post_action, pattern=r"^post:"))
     app.add_handler(CallbackQueryHandler(on_reminders, pattern=r"^rem:"))
     app.add_handler(CallbackQueryHandler(on_queue, pattern=r"^q:"))

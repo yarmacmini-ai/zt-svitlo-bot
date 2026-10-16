@@ -54,26 +54,34 @@ def day_inline(day: date, today: date) -> str:
     return f"{name} · {day.day} {MONTHS[day.month - 1]}, {WD_SHORT[day.weekday()]}"
 
 
-def summary(queues: dict[str, Slots]) -> str:
+# Легкий режим: графік обленерго — план «на випадок обмежень», його застосовують не завжди.
+LIGHT_NOTE = "ℹ️ Графіки зараз застосовують не завжди — сподіваємось, світло у вас буде 🤞"
+
+
+def summary(queues: dict[str, Slots], light: bool = False) -> str:
     off = [off_minutes(queues.get(q) or []) for q in QUEUES]
     hit = [m for m in off if m]
     if not hit:
         return "відключень не заплановано"
     span = hours(max(hit)) if min(hit) == max(hit) else f"від {hours(min(hit))[:-4]} до {hours(max(hit))}"
+    if light:
+        return f"можливі для {len(hit)} з 12 черг · {span}"
     return f"без світла {len(hit)} з 12 черг · {span}"
 
 
-def card_subtitle(day: date, queues: dict[str, Slots]) -> str:
-    return f"{WEEKDAYS[day.weekday()]} · {summary(queues)}"
+def card_subtitle(day: date, queues: dict[str, Slots], light: bool = False) -> str:
+    return f"{WEEKDAYS[day.weekday()]} · {summary(queues, light)}"
 
 
-def hour_bar(slots: Slots) -> str:
-    """Дві смужки по 12 годин: 🟩 світло є, 🟥 немає, 🟧 пів години без світла."""
+def hour_bar(slots: Slots, light: bool = False) -> str:
+    """Дві смужки по 12 годин: 🟩 світло є, 🟥 немає, 🟧 пів години без світла.
+    Легкий режим: 🟨 — можливе відключення (повна чи пів години)."""
     off = [0] * 48
     for a, b in slots:
         for i in range(minutes(a) // 30, minutes(b) // 30):
             off[i] = 1
-    cells = ["🟥" if off[2 * h] and off[2 * h + 1] else "🟧" if off[2 * h] or off[2 * h + 1] else "🟩"
+    full, half = ("🟨", "🟨") if light else ("🟥", "🟧")
+    cells = [full if off[2 * h] and off[2 * h + 1] else half if off[2 * h] or off[2 * h + 1] else "🟩"
              for h in range(24)]
     return f"<code>00</code> {''.join(cells[:12])}\n<code>12</code> {''.join(cells[12:])}"
 
@@ -110,16 +118,26 @@ def grouped(queues: dict[str, Slots]) -> list[tuple[list[str], Slots]]:
 
 def channel_caption(day: date, today: date, queues: dict[str, Slots], bot_username: str,
                     changed: set[str] | None = None, cancelled: bool = False,
-                    command: list | None = None) -> str:
-    """Підпис до картинки: шапка на 2–3 рядки, перелік черг — у згорнутій цитаті."""
+                    command: list | None = None, light: bool = False,
+                    updated: str | None = None) -> str:
+    """Підпис до картинки: шапка на 2–3 рядки, перелік черг — у згорнутій цитаті.
+
+    light — легкий режим: «можливі відключення», бурштинові позначки, приписка внизу.
+    updated — час оновлення, коли пост редагується на місці (легкий режим).
+    """
     when = day_inline(day, today)
     if cancelled:
         head = f"✅ <b>Відключення {when} скасовано</b>"
-    elif changed:
+    elif changed and not light:
         head = f"🔄 <b>Оновлено графік {when}</b> · змінилось: {', '.join(sorted(changed))}"
+    elif light:
+        head = f"🟡 <b>Графік можливих відключень {when}</b>"
     else:
         head = f"⚡️ <b>Графік відключень {when}</b>"
-    lines = [head, summary(queues).capitalize()]
+    lines = [head]
+    if light and updated:
+        lines.append(f"🔄 Оновлено о {updated}" + (f" · змінилось: {', '.join(sorted(changed))}" if changed else ""))
+    lines.append(summary(queues, light).capitalize())
     cmd = command_line(command)
     if cmd and not cancelled:
         lines.append(cmd)
@@ -127,9 +145,14 @@ def channel_caption(day: date, today: date, queues: dict[str, Slots], bot_userna
     for qs, slots in grouped(queues):
         mark = " ✏️" if changed and changed & set(qs) else ""
         body = f"{short_ranges(slots)} · {hours(off_minutes(slots))}" if slots else "світло є"
-        rows.append(f"{'🔴' if slots else '🟢'} <b>{' · '.join(qs)}</b> — {body}{mark}")
+        dot = ("🟡" if light else "🔴") if slots else "🟢"
+        rows.append(f"{dot} <b>{' · '.join(qs)}</b> — {body}{mark}")
     lines.append("<blockquote expandable>" + "\n".join(rows) + "</blockquote>")
-    lines.append(f"🔔 Своя черга й нагадування за 30 хв — @{bot_username}")
+    if light:
+        lines.append(LIGHT_NOTE)
+        lines.append(f"🔔 Графік своєї черги — @{bot_username}")
+    else:
+        lines.append(f"🔔 Своя черга й нагадування за 30 хв — @{bot_username}")
     return "\n".join(lines)
 
 
@@ -232,6 +255,16 @@ def personal_change(q: str, day: date, today: date, slots: Slots, prev: Slots | 
     if slots:
         lines += ["", hour_bar(slots)]
     return "\n".join(lines)
+
+
+def personal_light(q: str, day: date, today: date, slots: Slots) -> str:
+    """Легкий режим: одне тихе повідомлення на день для черги, без тривожного тону."""
+    when = day_inline(day, today)
+    return (f"🟡 <b>Черга {q}: можливі відключення {when}</b>\n"
+            f"{ranges(slots)} · {hours(off_minutes(slots))}\n\n"
+            f"{hour_bar(slots, light=True)}\n\n"
+            f"{LIGHT_NOTE}\n"
+            "Якщо графік зміниться — оновлений буде в /my")
 
 
 def personal_day(q: str, day: date, today: date, slots: Slots | None) -> str:

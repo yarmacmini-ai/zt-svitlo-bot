@@ -20,8 +20,10 @@ MUTED = "#7A7E86"
 FAINT = "#C9CCD1"
 TRACK = "#DDEFE0"      # світло є
 TICK = "#F4FAF5"
-OFF = "#E5484D"        # світла немає
+OFF = "#E5484D"        # світла немає (жорсткий режим)
 OFF_TEXT = "#FFFFFF"
+MAYBE = "#F2B23A"      # можливе відключення (легкий режим: графік є, але застосовують не завжди)
+MAYBE_TEXT = "#3B2A06"   # темний текст на бурштиновому — контраст краще за білий
 ACCENT = "#FFB800"
 CHANGED = "#FFF1C2"
 
@@ -74,14 +76,17 @@ def _bolt(d: ImageDraw.ImageDraw, x: int, y: int, s: int):
 
 
 def render(title: str, subtitle: str, queues: dict, *, updated: str | None = None,
-           changed: set[str] = frozenset(), footer: str = "") -> bytes:
+           changed: set[str] = frozenset(), footer: str = "", light: bool = False) -> bytes:
+    """light=True — легкий режим: бурштинові «можливі відключення» замість червоних."""
+    off, off_text = (MAYBE, MAYBE_TEXT) if light else (OFF, OFF_TEXT)
+    legend = "можливе відключення" if light else "немає світла"
     """title: «Завтра, 14 жовтня»; queues: {"1.1": [("08:00", "12:00")], ...}."""
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
     # --- шапка ---
     _bolt(d, PAD, 58, 34)
-    d.text((PAD + 48, 75), "ЖИТОМИРЩИНА · ГРАФІК ВІДКЛЮЧЕНЬ", font=font(26, 700), fill=MUTED, anchor="lm")
+    d.text((PAD + 48, 75), "ЖИТОМИРЩИНА · ГРАФІК МОЖЛИВИХ ВІДКЛЮЧЕНЬ" if light else "ЖИТОМИРЩИНА · ГРАФІК ВІДКЛЮЧЕНЬ", font=font(26, 700), fill=MUTED, anchor="lm")
     if updated:
         label = f"ОНОВЛЕНО {updated}"
         f = font(24, 800)
@@ -123,21 +128,21 @@ def render(title: str, subtitle: str, queues: dict, *, updated: str | None = Non
         for a, b in slots:
             ma, mb = minutes(a), minutes(b)
             bx0, bx1 = x0 + ma * per_min, x0 + mb * per_min
-            d.rounded_rectangle([bx0, cy - bar_h / 2, bx1, cy + bar_h / 2], radius=12, fill=OFF)
+            d.rounded_rectangle([bx0, cy - bar_h / 2, bx1, cy + bar_h / 2], radius=12, fill=off)
             # Не влазить навіть дрібним — без тексту: точні години є в підписі до поста.
             parts = _time_parts(a, b)
             for size in (24, 22, 20):
                 if _range_width(d, parts, size) + 8 <= bx1 - bx0:
-                    _draw_range(d, (bx0 + bx1) / 2, cy + 1, parts, size, OFF_TEXT)
+                    _draw_range(d, (bx0 + bx1) / 2, cy + 1, parts, size, off_text)
                     break
 
         y += row_h + (pair_gap if i % 2 else 0)
 
     # --- легенда й підпис ---
     ly = bottom + 44
-    d.rounded_rectangle([PAD, ly - 13, PAD + 40, ly + 13], radius=7, fill=OFF)
-    d.text((PAD + 54, ly), "немає світла", font=font(26, 600), fill=INK, anchor="lm")
-    lx = PAD + 54 + d.textlength("немає світла", font=font(26, 600)) + 40
+    d.rounded_rectangle([PAD, ly - 13, PAD + 40, ly + 13], radius=7, fill=off)
+    d.text((PAD + 54, ly), legend, font=font(26, 600), fill=INK, anchor="lm")
+    lx = PAD + 54 + d.textlength(legend, font=font(26, 600)) + 40
     d.rounded_rectangle([lx, ly - 13, lx + 40, ly + 13], radius=7, fill=TRACK)
     d.text((lx + 54, ly), "світло є", font=font(26, 600), fill=INK, anchor="lm")
     d.text((W - PAD, ly), "Дані: Житомиробленерго", font=font(24, 500), fill=MUTED, anchor="rm")
