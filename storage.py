@@ -19,6 +19,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS sent(key TEXT PRIMARY KEY, day TEXT);
             CREATE TABLE IF NOT EXISTS prefs(user_id INTEGER PRIMARY KEY, reminders INTEGER);
+            CREATE TABLE IF NOT EXISTS users(
+                user_id INTEGER PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                blocked INTEGER DEFAULT 0);
             """
         )
 
@@ -50,6 +53,27 @@ class Store:
     def subscriber_count(self) -> int:
         return self.db.execute(
             "SELECT COUNT(DISTINCT user_id) FROM subs").fetchone()[0]
+
+    # --- усі користувачі бота (для розсилок) ---
+    def touch_user(self, user_id: int) -> None:
+        """Запам'ятати користувача; якщо раніше заблокував бота, а тепер пише — знову активний."""
+        self.db.execute("INSERT INTO users(user_id) VALUES(?) ON CONFLICT(user_id) DO UPDATE "
+                        "SET blocked=0 WHERE blocked=1", (user_id,))
+        self.db.commit()
+
+    def mark_blocked(self, user_id: int) -> None:
+        self.db.execute("INSERT INTO users(user_id, blocked) VALUES(?, 1) "
+                        "ON CONFLICT(user_id) DO UPDATE SET blocked=1", (user_id,))
+        self.db.commit()
+
+    def audience(self) -> list[int]:
+        """Кому слати розсилку: усі, хто писав боту, плюс підписники (з часів до таблиці users),
+        крім тих, хто заблокував бота."""
+        rows = self.db.execute(
+            "SELECT user_id FROM users WHERE blocked=0 UNION "
+            "SELECT DISTINCT user_id FROM subs WHERE user_id NOT IN "
+            "(SELECT user_id FROM users WHERE blocked=1)")
+        return [r[0] for r in rows]
 
     def reminders_on(self, user_id: int) -> bool:
         row = self.db.execute("SELECT reminders FROM prefs WHERE user_id=?", (user_id,)).fetchone()

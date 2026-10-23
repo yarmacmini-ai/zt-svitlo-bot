@@ -20,7 +20,7 @@ from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
                       Update)
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler,
-                          CommandHandler, ContextTypes, MessageHandler, filters)
+                          CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters)
 
 import address
 import card
@@ -83,13 +83,15 @@ def reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
 BTN_FIND, BTN_MY, BTN_QUEUES = "🔎 Знайти чергу за адресою", "📅 Мій графік", "🔢 Мої черги"
 BTN_REMIND, BTN_HELP = "⏰ Нагадування", "❓ Допомога"
 BTN_POST, BTN_CARD, BTN_MODE = "📢 Новий пост", "🖼 Графік у канал", "⚙️ Режим"
-MENU_BUTTONS = {BTN_FIND, BTN_MY, BTN_QUEUES, BTN_REMIND, BTN_HELP, BTN_POST, BTN_CARD, BTN_MODE}
+BTN_BROADCAST = "✉️ Розсилка в бот"
+MENU_BUTTONS = {BTN_FIND, BTN_MY, BTN_QUEUES, BTN_REMIND, BTN_HELP, BTN_POST, BTN_CARD, BTN_MODE,
+                BTN_BROADCAST}
 
 
 def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
     rows = [[BTN_FIND], [BTN_MY, BTN_QUEUES], [BTN_REMIND, BTN_HELP]]
     if admin:
-        rows += [[BTN_POST, BTN_CARD], [BTN_MODE]]
+        rows += [[BTN_POST, BTN_CARD], [BTN_BROADCAST, BTN_MODE]]
     return ReplyKeyboardMarkup([[KeyboardButton(b) for b in r] for r in rows],
                                resize_keyboard=True, is_persistent=True)
 
@@ -165,6 +167,8 @@ async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_preview(update, ctx)
     elif btn == BTN_MODE:
         await show_mode(update, ctx)
+    elif btn == BTN_BROADCAST:
+        await start_broadcast(update, ctx)
 
 
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -440,7 +444,9 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"Підписників: {store.subscriber_count()}")
+    await update.effective_message.reply_text(
+        f"Підписників черг: {store.subscriber_count()}\n"
+        f"Користувачів бота (аудиторія розсилки): {len(store.audience())}")
 
 
 # ---------- опитування джерела ----------
@@ -761,7 +767,7 @@ def compose_keyboard(with_button: bool) -> InlineKeyboardMarkup:
 async def start_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await channel_admin(update, ctx):
         return
-    ctx.user_data["compose"] = True
+    ctx.user_data["compose"] = "channel"
     await update.effective_message.reply_text(
         "📢 Надішліть пост одним повідомленням: текст, фото чи відео з підписом. "
         "Форматування (жирний, посилання, цитати) збережеться.\n\n"
@@ -771,9 +777,13 @@ async def start_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Ловить чернетку поста, поки адмін у режимі «Новий пост». Інакше пропускає далі."""
     msg = update.effective_message
-    if not ctx.user_data.get("compose") or msg.text in MENU_BUTTONS:
+    kind = ctx.user_data.get("compose")
+    if not kind or msg.text in MENU_BUTTONS:
         return
-    ctx.user_data["compose"] = False
+    ctx.user_data["compose"] = None
+    if kind == "broadcast":
+        await broadcast_preview(msg, ctx)
+        raise ApplicationHandlerStop
     with_button = ctx.user_data.setdefault("post_btn", True)
     preview = await ctx.bot.copy_message(
         msg.chat_id, msg.chat_id, msg.message_id,
@@ -823,6 +833,106 @@ async def on_post_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"✅ Опубліковано: {link}")
 
 
+# ---------- розсилка всім користувачам бота ----------
+BROADCAST_PAUSE = 0.05  # ~20 повідомлень/с — нижче ліміту Telegram у 30/с
+
+
+def broadcast_keyboard(n: int, silent: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Надіслати {n} користувачам", callback_data="bc:send")],
+        [InlineKeyboardButton("🔕 Без звуку" if silent else "🔔 Зі звуком", callback_data="bc:sound")],
+        [InlineKeyboardButton("✏️ Інший варіант", callback_data="bc:again"),
+         InlineKeyboardButton("❌ Скасувати", callback_data="bc:cancel")],
+    ])
+
+
+async def start_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await channel_admin(update, ctx):
+        return
+    ctx.user_data["compose"] = "broadcast"
+    await update.effective_message.reply_text(
+        f"✉️ Розсилка в особисті всім користувачам бота ({len(store.audience())}). "
+        "Не в канал.\n\nНадішліть повідомлення: текст, фото чи відео з підписом — "
+        "форматування збережеться. Я покажу прев'ю і попрошу підтвердити.")
+
+
+async def broadcast_preview(msg, ctx):
+    silent = ctx.user_data.setdefault("bc_silent", False)
+    await ctx.bot.copy_message(msg.chat_id, msg.chat_id, msg.message_id)
+    ctx.user_data["bc_draft"] = (msg.chat_id, msg.message_id)
+    await msg.reply_text("👆 Так повідомлення побачать користувачі бота.",
+                         reply_markup=broadcast_keyboard(len(store.audience()), silent))
+
+
+async def on_broadcast_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    draft = ctx.user_data.get("bc_draft")
+    if action in ("send", "sound") and not draft:
+        await query.answer("Чернетку не знайдено — почніть заново: «✉️ Розсилка в бот»", show_alert=True)
+        return
+    if action == "sound":
+        silent = not ctx.user_data.get("bc_silent", False)
+        ctx.user_data["bc_silent"] = silent
+        await query.edit_message_reply_markup(broadcast_keyboard(len(store.audience()), silent))
+        await query.answer("Без звуку" if silent else "Зі звуком")
+        return
+    await query.answer()
+    await query.edit_message_reply_markup(None)
+    if action == "again":
+        await start_broadcast(update, ctx)
+    elif action == "cancel":
+        ctx.user_data.pop("bc_draft", None)
+        await query.message.reply_text("Скасовано, нікому нічого не пішло.")
+    elif action == "send":
+        if not await channel_admin(update, ctx):
+            return
+        ctx.user_data.pop("bc_draft", None)  # подвійне натискання не розішле двічі
+        users = store.audience()
+        await query.message.reply_text(f"⏳ Надсилаю {len(users)} користувачам… Напишу, коли закінчу.")
+        ctx.application.create_task(run_broadcast(
+            ctx.bot, query.message.chat_id, *draft, users, ctx.user_data.get("bc_silent", False)))
+
+
+async def run_broadcast(bot, admin_chat: int, from_chat: int, message_id: int,
+                        users: list[int], silent: bool):
+    """Копіює повідомлення адміна кожному у фоні; звіт адміну наприкінці."""
+    ok = blocked = failed = 0
+    for uid in users:
+        for attempt in range(2):
+            try:
+                await bot.copy_message(uid, from_chat, message_id, disable_notification=silent)
+                ok += 1
+            except RetryAfter as e:
+                if attempt == 0:
+                    await asyncio.sleep(e.retry_after + 1)
+                    continue
+                failed += 1
+            except Forbidden:  # заблокував бота або видалив акаунт
+                store.mark_blocked(uid)
+                store.unsubscribe_all(uid)
+                blocked += 1
+            except TelegramError:
+                log.exception("Розсилка: не вдалося надіслати %s", uid)
+                failed += 1
+            break
+        await asyncio.sleep(BROADCAST_PAUSE)
+    log.info("Розсилка: %d надіслано, %d заблокували, %d помилок", ok, blocked, failed)
+    report = f"✅ Розсилку завершено: надіслано {ok}"
+    if blocked:
+        report += f", заблокували бота {blocked} (більше їм не пишу)"
+    if failed:
+        report += f", помилок {failed} (деталі в логах)"
+    await bot.send_message(admin_chat, report + ".")
+
+
+async def track_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кожен, хто пише боту в особисті, потрапляє в аудиторію розсилок."""
+    chat = update.effective_chat
+    if chat and chat.type == "private" and update.effective_user:
+        store.touch_user(update.effective_user.id)
+
+
 async def cmd_testpost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Тестовий пост у канал. Доступний лише адмінам каналу."""
     if not await channel_admin(update, ctx):
@@ -855,6 +965,7 @@ async def post_init(app: Application):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(TypeHandler(Update, track_user), group=-2)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("stop", cmd_stop))
@@ -868,6 +979,8 @@ def main():
         filters.ChatType.PRIVATE & filters.Text(list(MENU_BUTTONS)), on_menu_button))
     app.add_handler(CallbackQueryHandler(on_card_publish, pattern=r"^card:"))
     app.add_handler(CallbackQueryHandler(on_mode, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(on_broadcast_action, pattern=r"^bc:"))
+    app.add_handler(CommandHandler("broadcast", start_broadcast))
     app.add_handler(CommandHandler("mode", show_mode))
     app.add_handler(CallbackQueryHandler(on_post_action, pattern=r"^post:"))
     app.add_handler(CallbackQueryHandler(on_reminders, pattern=r"^rem:"))
