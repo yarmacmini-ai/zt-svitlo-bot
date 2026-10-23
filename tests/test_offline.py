@@ -18,6 +18,8 @@ T, TM = date(2026, 10, 13), date(2026, 10, 14)
 CH, ADMIN, USER = "-1003948683401", 7, 8
 sent = []
 silent: dict = {}
+BLOCKED = {99}
+tasks = []
 
 
 # ---------- фейковий Telegram ----------
@@ -66,7 +68,12 @@ class FakeBot:
         sent.append(("edit_media", chat_id, media.caption, message_id))
         return Msg(chat=chat_id, mid=message_id)
 
-    async def copy_message(self, to, frm, mid, reply_markup=None):
+    async def copy_message(self, to, frm, mid, reply_markup=None, disable_notification=False):
+        if to in BLOCKED:
+            from telegram.error import Forbidden
+            raise Forbidden("bot was blocked by the user")
+        if disable_notification:
+            silent[to] = True
         sent.append(("copy", to, mid, bool(reply_markup)))
         return self._msg(to)
 
@@ -94,6 +101,7 @@ class Upd:
 class Ctx:
     bot = FakeBot()
     user_data: dict = {}
+    application = type("App", (), {"create_task": staticmethod(lambda coro: tasks.append(coro))})
 
 
 def at(d: date, h: int, m: int):
@@ -231,10 +239,43 @@ async def test_light():
     sent.clear()
 
 
+async def test_broadcast():
+    """Розсилка в особисті: прев'ю, без звуку, фон, звіт; заблоковані випадають з аудиторії."""
+    for uid in (50, 51, 99):
+        bot.store.touch_user(uid)
+    n = len(bot.store.audience())
+    Ctx.user_data = {}
+    await bot.on_menu_button(Upd(bot.BTN_BROADCAST), Ctx)
+    assert Ctx.user_data["compose"] == "broadcast" and f"({n})" in sent[-1][2]
+    try:
+        await bot.on_compose(Upd("Привіт усім 👋", mid=777), Ctx)
+        raise AssertionError("чернетка розсилки має зупиняти інші обробники")
+    except ApplicationHandlerStop:
+        pass
+    assert sent[-2][:3] == ("copy", ADMIN, 777) and f"Надіслати {n}" in sent[-1][3][0][0]
+    await bot.on_broadcast_action(Upd(data="bc:sound"), Ctx)
+    sent.clear(); silent.clear()
+    await bot.on_broadcast_action(Upd(data="bc:send"), Ctx)
+    await bot.on_broadcast_action(Upd(data="bc:send"), Ctx)  # подвійне натискання
+    assert len(tasks) == 1, "друге натискання не має запустити ще одну розсилку"
+    bot.BROADCAST_PAUSE = 0
+    await tasks.pop()
+    copies = [x for x in sent if x[0] == "copy"]
+    assert len(copies) == n - 1 and all(silent.get(x[1]) for x in copies), (copies, silent)
+    assert "надіслано" in sent[-1][2] and "заблокували бота 1" in sent[-1][2], sent[-1]
+    assert 99 not in bot.store.audience()
+    # не адмін не може
+    Ctx.user_data = {}
+    await bot.on_menu_button(Upd(bot.BTN_BROADCAST, uid=USER), Ctx)
+    assert "лише для адмінів" in sent[-1][2] and not Ctx.user_data.get("compose")
+    sent.clear()
+
+
 async def main():
     test_posts()
     await test_flow()
     await test_light()
+    await test_broadcast()
     await test_catchup()
     await test_menu_and_posts()
     print("OK")
